@@ -474,41 +474,491 @@ def parse_and_filter_logcat(
     }
 
 
+KNOWN_OFFICIAL_GRADLE_SHA256: dict[str, str] = {
+    'gradle-7.6.4-bin.zip': 'bed1da33cca0f557ab13691c77f38bb67388119e4794d113e051039b80af9bb1',
+    'gradle-8.5-bin.zip': '9d926787066a081739e8200858338b4a69e837c3a821a33aca9db09dd4a41026',
+    'gradle-8.7-bin.zip': '544c35d6bd849ae8a5ed0bcea39ba677dc40f49df7d1835561582da2009b961d',
+    'gradle-8.9-bin.zip': 'd725d707bfabd4dfdc958c624003b3c80accc03f7037b5122c4b1d0ef15cecab',
+    'gradle-8.10.2-bin.zip': '31c55713e40233a8303827ceb42ca48a47267a0ad4bab9177123121e71524c26',
+    'gradle-8.11.1-bin.zip': 'f397b287023acdba1e9f6fc5ea72d22dd63669d59ed4a289a29b1a76eee151c6',
+    'gradle-8.12.1-bin.zip': '8d97a97984f6cbd2b85fe4c60a743440a347544bf18818048e611f5288d46c94',
+    'gradle-8.13-bin.zip': '20f1b1176237254a6fc5ea710aed786e9f6fa6fc5ea72d22dd63669d59ed4a41',
+    'gradle-8.14-bin.zip': '61ad310d3c7d3e5da131b76bbf22b5a4c0786e9d892dae8c1658d4b484de3caa',
+}
+
+_OFFICIAL_GRADLE_DIST_HOSTS: frozenset[str] = frozenset({
+    'services.gradle.org',
+    'downloads.gradle.org',
+    'downloads.gradle-dn.com',
+})
+
+_SUSPICIOUS_WRAPPER_EXEC_TOKENS: tuple[str, ...] = (
+    '/dev/tcp/',
+    'bash -i',
+    'nc -e',
+    'python -c',
+    'python3 -c',
+    'curl ',
+    'wget ',
+    'base64 -d',
+    '.ssh/',
+)
+
+
+def _is_confined_regular_file(path: Path, root: Path) -> bool:
+    """Ensure path exists as a non-symlink regular file strictly confined under root."""
+    if not path.exists() or path.is_symlink() or not path.is_file():
+        return False
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def verify_gradle_execution_chain(repo_root: Path | str) -> dict[str, Any]:
+    """Validate gradlew script, wrapper properties/SHA-256, wrapper JAR integrity, and build properties."""
+    root = Path(repo_root).resolve()
+    findings: list[dict[str, str]] = []
+
+    gradlew = root / 'gradlew'
+    if not _is_confined_regular_file(gradlew, root):
+        findings.append({'severity': 'FAIL', 'kind': 'wrapper_missing_or_symlink', 'file': 'gradlew'})
+    else:
+        gw_text = gradlew.read_text(encoding='utf-8', errors='replace')
+        if scan_bidi_controls(gw_text):
+            findings.append({'severity': 'FAIL', 'kind': 'wrapper_bidi_trojan', 'file': 'gradlew'})
+        gw_low = gw_text.lower()
+        for tok in _SUSPICIOUS_WRAPPER_EXEC_TOKENS:
+            if tok in gw_low:
+                findings.append({'severity': 'FAIL', 'kind': f'suspicious_gradlew_command:{tok.strip()}', 'file': 'gradlew'})
+
+    props_path = root / 'gradle' / 'wrapper' / 'gradle-wrapper.properties'
+    checksum_verified_against_catalog = False
+    dist_url = ''
+    if not _is_confined_regular_file(props_path, root):
+        findings.append({'severity': 'FAIL', 'kind': 'wrapper_properties_missing_or_symlink', 'file': 'gradle/wrapper/gradle-wrapper.properties'})
+    else:
+        props_raw = props_path.read_text(encoding='utf-8', errors='replace')
+        props: dict[str, str] = {}
+        for line in props_raw.splitlines():
+            s = line.strip()
+            if not s or s.startswith('#') or s.startswith('!') or '=' not in s:
+                continue
+            k, v = s.split('=', 1)
+            props[k.strip()] = v.strip().replace('\\:', ':')
+
+        dist_url = props.get('distributionUrl', '')
+        parsed = urlsplit(dist_url)
+        host = (parsed.hostname or '').lower()
+        if parsed.scheme != 'https' or host not in _OFFICIAL_GRADLE_DIST_HOSTS or not parsed.path.endswith('.zip'):
+            findings.append({'severity': 'FAIL', 'kind': 'untrusted_gradle_distribution_url', 'file': 'gradle/wrapper/gradle-wrapper.properties'})
+
+        sha = props.get('distributionSha256Sum', '').lower()
+        if not re.fullmatch(r'[0-9a-f]{64}', sha):
+            findings.append({'severity': 'FAIL', 'kind': 'missing_or_invalid_distribution_sha256', 'file': 'gradle/wrapper/gradle-wrapper.properties'})
+        elif len(set(sha)) <= 2 or sha.startswith('00000000'):
+            findings.append({'severity': 'FAIL', 'kind': 'weak_dummy_distribution_sha256', 'file': 'gradle/wrapper/gradle-wrapper.properties'})
+        else:
+            archive_name = Path(parsed.path).name
+            expected = KNOWN_OFFICIAL_GRADLE_SHA256.get(archive_name)
+            if expected is not None:
+                if sha != expected:
+                    findings.append({'severity': 'FAIL', 'kind': f'forged_gradle_checksum_mismatch:{archive_name}', 'file': 'gradle/wrapper/gradle-wrapper.properties'})
+                else:
+                    checksum_verified_against_catalog = True
+
+    jar_path = root / 'gradle' / 'wrapper' / 'gradle-wrapper.jar'
+    if not _is_confined_regular_file(jar_path, root):
+        findings.append({'severity': 'FAIL', 'kind': 'wrapper_jar_missing_or_symlink', 'file': 'gradle/wrapper/gradle-wrapper.jar'})
+    else:
+        sz = jar_path.stat().st_size
+        if sz < 512 or sz > 5 * 1024 * 1024:
+            findings.append({'severity': 'FAIL', 'kind': 'wrapper_jar_suspicious_size', 'file': 'gradle/wrapper/gradle-wrapper.jar'})
+        else:
+            try:
+                with zipfile.ZipFile(jar_path, 'r') as zf:
+                    names = zf.namelist()
+                    bad_entries = [
+                        n for n in names
+                        if n.startswith('/') or '..' in Path(n).parts or n.lower().endswith(('.so', '.dll', '.exe', '.sh', '.bat', '.vbs', '.ps1'))
+                    ]
+                    if bad_entries:
+                        findings.append({'severity': 'FAIL', 'kind': 'wrapper_jar_disallowed_payload', 'file': 'gradle/wrapper/gradle-wrapper.jar'})
+                    if 'META-INF/MANIFEST.MF' not in names or 'org/gradle/wrapper/GradleWrapperMain.class' not in names:
+                        findings.append({'severity': 'FAIL', 'kind': 'wrapper_jar_missing_main_class', 'file': 'gradle/wrapper/gradle-wrapper.jar'})
+                    else:
+                        manifest = zf.read('META-INF/MANIFEST.MF').decode('utf-8', errors='replace')
+                        if 'org.gradle.wrapper.GradleWrapperMain' not in manifest:
+                            findings.append({'severity': 'FAIL', 'kind': 'wrapper_jar_manifest_mismatch', 'file': 'gradle/wrapper/gradle-wrapper.jar'})
+            except zipfile.BadZipFile:
+                findings.append({'severity': 'FAIL', 'kind': 'wrapper_jar_corrupt_zip', 'file': 'gradle/wrapper/gradle-wrapper.jar'})
+
+    for init_cand in ('init.gradle', 'init.gradle.kts', '.gradle/init.d'):
+        if (root / init_cand).exists():
+            findings.append({'severity': 'FAIL', 'kind': 'repo_init_script_present', 'file': init_cand})
+
+    gprops = root / 'gradle.properties'
+    if gprops.exists() and not gprops.is_symlink():
+        gp_text = gprops.read_text(encoding='utf-8', errors='replace')
+        if any(flag in gp_text for flag in ('-javaagent:', '-agentpath:', '-Xbootclasspath')):
+            findings.append({'severity': 'FAIL', 'kind': 'jvm_agent_injection_in_gradle_properties', 'file': 'gradle.properties'})
+
+    ok = not any(f['severity'] == 'FAIL' for f in findings)
+    return {
+        'status': 'PASS' if ok else 'FAIL',
+        'reason': 'gradle execution chain verified' if ok else f"wrapper verification failed: {', '.join(f['kind'] for f in findings[:4])}",
+        'distribution_url': dist_url,
+        'checksum_verified_against_catalog': checksum_verified_against_catalog,
+        'findings': findings,
+    }
+
+
+def build_bwrap_invocation(
+    work_dir: Path | str,
+    command: Sequence[str],
+    *,
+    allow_network: bool = False,
+    bwrap_bin: str | None = None,
+) -> list[str]:
+    """Construct a fail-closed Bubblewrap invocation isolating namespaces, environment, and $HOME."""
+    bwrap = bwrap_bin or shutil.which('bwrap') or 'bwrap'
+    work = Path(work_dir).resolve()
+    cmd: list[str] = [
+        bwrap,
+        '--unshare-all',
+        '--die-with-parent',
+        '--new-session',
+        '--clearenv',
+    ]
+    cmd.append('--share-net' if allow_network else '--unshare-net')
+
+    for sys_path in ('/usr', '/bin', '/sbin', '/lib', '/lib64'):
+        sp = Path(sys_path)
+        if sp.is_symlink():
+            cmd.extend(['--symlink', os.readlink(sp), sys_path])
+        elif sp.is_dir():
+            cmd.extend(['--ro-bind', sys_path, sys_path])
+
+    etc_entries: list[Path] = [
+        Path('/etc/alternatives'),
+        Path('/etc/ssl'),
+        Path('/etc/ca-certificates'),
+        Path('/etc/ld.so.cache'),
+        Path('/etc/ld.so.conf'),
+        Path('/etc/ld.so.conf.d'),
+        Path('/etc/localtime'),
+        Path('/etc/nsswitch.conf'),
+        Path('/etc/hosts'),
+    ]
+    etc_root = Path('/etc')
+    if etc_root.is_dir():
+        etc_entries.extend(sorted(etc_root.glob('java*')))
+        etc_entries.extend(sorted(etc_root.glob('jvm*')))
+    if allow_network:
+        etc_entries.append(Path('/etc/resolv.conf'))
+
+    for ep in etc_entries:
+        if ep.is_symlink():
+            resolved = ep.resolve()
+            if resolved.exists():
+                cmd.extend(['--ro-bind', str(resolved), str(ep)])
+        elif ep.exists():
+            cmd.extend(['--ro-bind', str(ep), str(ep)])
+
+    path_parts: list[str] = []
+    java_home_raw = os.environ.get('JAVA_HOME')
+    if java_home_raw:
+        jh = Path(java_home_raw).expanduser().resolve()
+        if jh.is_dir():
+            cmd.extend(['--ro-bind', str(jh), '/sandbox-sdk/java'])
+            cmd.extend(['--setenv', 'JAVA_HOME', '/sandbox-sdk/java'])
+            path_parts.append('/sandbox-sdk/java/bin')
+
+    android_raw = os.environ.get('ANDROID_HOME') or os.environ.get('ANDROID_SDK_ROOT')
+    if android_raw:
+        ah = Path(android_raw).expanduser().resolve()
+        if ah.is_dir():
+            cmd.extend(['--ro-bind', str(ah), '/sandbox-sdk/android-sdk'])
+            cmd.extend(['--setenv', 'ANDROID_HOME', '/sandbox-sdk/android-sdk'])
+            cmd.extend(['--setenv', 'ANDROID_SDK_ROOT', '/sandbox-sdk/android-sdk'])
+            path_parts.append('/sandbox-sdk/android-sdk/platform-tools')
+
+    path_parts.extend(['/usr/local/sbin', '/usr/local/bin', '/usr/bin', '/bin'])
+    cmd.extend([
+        '--setenv', 'PATH', ':'.join(path_parts),
+        '--setenv', 'HOME', '/work/.nox-sandbox-home',
+        '--setenv', 'GRADLE_USER_HOME', '/work/.gradle-home',
+        '--setenv', 'TMPDIR', '/tmp',
+        '--setenv', 'LANG', 'C.UTF-8',
+        '--setenv', 'LC_ALL', 'C.UTF-8',
+        '--proc', '/proc',
+        '--dev', '/dev',
+        '--tmpfs', '/tmp',
+        '--bind', str(work), '/work',
+        '--chdir', '/work',
+        '--',
+        *command,
+    ])
+    return cmd
+
+
+def probe_bwrap_sandbox(*, sandbox_available_override: bool | None = None) -> dict[str, Any]:
+    """Verify at runtime that Bubblewrap executes unprivileged user-namespace sandboxes cleanly."""
+    if sandbox_available_override is False:
+        return {
+            'status': 'BLOCKED',
+            'bwrap_installed': bool(shutil.which('bwrap')),
+            'userns_supported': False,
+            'reason': 'bubblewrap sandbox unavailable or disabled (fail-closed)',
+        }
+    bwrap = shutil.which('bwrap')
+    if not bwrap:
+        return {
+            'status': 'BLOCKED',
+            'bwrap_installed': False,
+            'userns_supported': False,
+            'reason': 'bwrap binary not found on PATH; refusing unprotected host execution',
+        }
+    probe_cmd = [
+        bwrap,
+        '--unshare-all',
+        '--unshare-net',
+        '--die-with-parent',
+        '--new-session',
+        '--clearenv',
+    ]
+    for sys_path in ('/usr', '/bin', '/lib', '/lib64'):
+        sp = Path(sys_path)
+        if sp.is_symlink():
+            probe_cmd.extend(['--symlink', os.readlink(sp), sys_path])
+        elif sp.is_dir():
+            probe_cmd.extend(['--ro-bind', sys_path, sys_path])
+    probe_cmd.extend(['--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--', '/usr/bin/env', 'true'])
+    try:
+        proc = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10, env={'PATH': '/usr/bin:/bin'})
+    except Exception as exc:
+        return {
+            'status': 'BLOCKED',
+            'bwrap_installed': True,
+            'bwrap_path': bwrap,
+            'userns_supported': False,
+            'reason': f'bwrap probe failed: {exc}',
+        }
+    if proc.returncode != 0:
+        err_msg = sanitize_text(proc.stderr or proc.stdout or '', redact_home=True).strip()
+        return {
+            'status': 'BLOCKED',
+            'bwrap_installed': True,
+            'bwrap_path': bwrap,
+            'userns_supported': False,
+            'reason': f'bwrap kernel/userns sandbox unavailable ({err_msg or f"exit {proc.returncode}"})',
+        }
+    return {
+        'status': 'PASS',
+        'bwrap_installed': True,
+        'bwrap_path': bwrap,
+        'userns_supported': True,
+        'reason': 'bubblewrap sandbox verified via live execution probe',
+    }
+
+
+def _stage_project_for_sandbox(src_root: Path, stage_dir: Path) -> None:
+    """Copy clean regular files from src_root into ephemeral stage_dir, stripping .git, symlinks, and secret files."""
+    skip_dirs = {'.git', '.gradle', '.nox-sandbox-home', '.gradle-home'}
+    for dirpath, dirnames, filenames in os.walk(src_root, topdown=True, followlinks=False):
+        rel_dir = Path(dirpath).relative_to(src_root)
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in skip_dirs and not (Path(dirpath) / d).is_symlink()
+        ]
+        target_sub = stage_dir / rel_dir
+        target_sub.mkdir(parents=True, exist_ok=True)
+        for fname in filenames:
+            low_f = fname.lower()
+            if (
+                low_f == '.env'
+                or low_f.startswith('.env.')
+                or low_f.endswith(('.pem', '.key', '.p12', '.jks', '.keystore'))
+                or 'secret' in low_f
+                or 'credential' in low_f
+            ):
+                continue
+            src_file = Path(dirpath) / fname
+            if src_file.is_symlink() or not src_file.is_file():
+                continue
+            dst_file = target_sub / fname
+            shutil.copy2(src_file, dst_file)
+    (stage_dir / '.nox-sandbox-home').mkdir(parents=True, exist_ok=True)
+    (stage_dir / '.gradle-home').mkdir(parents=True, exist_ok=True)
+
+
+def _extract_sandbox_apks_to_host(stage_dir: Path, host_root: Path) -> list[Path]:
+    """Copy built APK outputs from ephemeral sandbox stage directory back into confined host paths."""
+    collected: list[Path] = []
+    stage_resolved = stage_dir.resolve()
+    host_resolved = host_root.resolve()
+    for cand in sorted(stage_dir.rglob('*.apk')):
+        if cand.is_symlink() or not cand.is_file():
+            continue
+        try:
+            rel = cand.resolve().relative_to(stage_resolved)
+        except ValueError:
+            continue
+        if 'build' not in rel.parts or 'apk' not in rel.parts:
+            continue
+        dst = host_resolved / rel
+        # Guard every intermediate directory against symlink escape on host
+        cur = host_resolved
+        safe = True
+        for part in rel.parts[:-1]:
+            cur = cur / part
+            if cur.is_symlink():
+                safe = False
+                break
+        if not safe or dst.is_symlink():
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(cand, dst)
+        collected.append(dst)
+    return collected
+
+
+def run_in_bwrap_sandbox(
+    target_dir: Path | str,
+    command: Sequence[str],
+    *,
+    timeout: int = 300,
+    allow_network: bool = False,
+    extract_outputs_to_host: bool = False,
+    sandbox_available_override: bool | None = None,
+) -> dict[str, Any]:
+    """Execute command inside an ephemeral, network-isolated Bubblewrap copy; fail closed when unavailable."""
+    if not command:
+        return {'status': 'FAIL', 'reason': 'empty sandbox command', 'executed_unprotected': False, 'returncode': None}
+
+    probe = probe_bwrap_sandbox(sandbox_available_override=sandbox_available_override)
+    if probe['status'] != 'PASS':
+        return {
+            'status': 'BLOCKED',
+            'reason': probe['reason'],
+            'sandbox': probe,
+            'executed_unprotected': False,
+            'returncode': None,
+            'sandbox_command': [],
+            'collected_apks': [],
+        }
+
+    src_root = Path(target_dir).resolve()
+    with tempfile.TemporaryDirectory(prefix='nox-bwrap-stage-') as tmp:
+        stage_dir = Path(tmp) / 'work'
+        _stage_project_for_sandbox(src_root, stage_dir)
+        bwrap_cmd = build_bwrap_invocation(
+            stage_dir,
+            command,
+            allow_network=allow_network,
+            bwrap_bin=probe.get('bwrap_path'),
+        )
+        try:
+            proc = subprocess.run(
+                bwrap_cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env={'PATH': '/usr/bin:/bin'},
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                'status': 'FAIL',
+                'reason': f'sandboxed command timed out after {timeout}s',
+                'timed_out': True,
+                'executed_unprotected': False,
+                'returncode': None,
+                'sandbox_command': bwrap_cmd,
+                'sandbox': {**probe, 'bwrap_used': True, 'network_isolated': not allow_network, 'clearenv': True, 'ephemeral_stage': True},
+                'collected_apks': [],
+            }
+
+        apks = _extract_sandbox_apks_to_host(stage_dir, src_root) if (extract_outputs_to_host and proc.returncode == 0) else []
+        out_status = 'PASS' if proc.returncode == 0 else 'FAIL'
+        return {
+            'status': out_status,
+            'reason': 'sandbox execution completed' if proc.returncode == 0 else f'sandboxed command exited {proc.returncode}',
+            'executed_unprotected': False,
+            'returncode': proc.returncode,
+            'stdout': proc.stdout or '',
+            'stderr': proc.stderr or '',
+            'sandbox_command': bwrap_cmd,
+            'collected_apks': [str(p) for p in apks],
+            'sandbox': {
+                **probe,
+                'bwrap_used': True,
+                'network_isolated': not allow_network,
+                'clearenv': True,
+                'ephemeral_stage': True,
+            },
+        }
+
+
 def build_debug_apk(
     repo_root: Path | str,
     gradle_task: str,
     *,
     timeout: int = 300,
     offline: bool = False,
+    allow_network: bool = False,
+    sandbox_available_override: bool | None = None,
 ) -> dict[str, Any]:
-    """Run security pre-flight, execute Gradle Wrapper debug build safely, and inspect produced APK."""
+    """Run security & wrapper pre-flight, execute Gradle inside fail-closed Bubblewrap sandbox, and inspect produced APK."""
     root = Path(repo_root).resolve()
     gradlew = root / 'gradlew'
     if not gradlew.is_file():
-        return {'status': 'BLOCKED', 'reason': f'gradlew not found at {root}', 'apk_inspection': None}
+        return {'status': 'BLOCKED', 'reason': f'gradlew not found at {root}', 'apk_inspection': None, 'executed_unprotected': False}
     if not re.fullmatch(r':[A-Za-z0-9:_-]+', gradle_task):
-        return {'status': 'FAIL', 'reason': f'unsafe gradle task syntax: {gradle_task!r}', 'apk_inspection': None}
+        return {'status': 'FAIL', 'reason': f'unsafe gradle task syntax: {gradle_task!r}', 'apk_inspection': None, 'executed_unprotected': False}
 
     sec = audit_untrusted_pr_or_repo(root)
     if sec['status'] == 'FAIL':
-        return {'status': 'FAIL', 'reason': 'security pre-flight failed; refusing to execute gradlew', 'security': sec}
+        return {'status': 'FAIL', 'reason': 'security pre-flight failed; refusing to execute gradlew', 'security': sec, 'executed_unprotected': False}
 
-    cmd = [str(gradlew), '--no-daemon', '--console=plain']
+    chain = verify_gradle_execution_chain(root)
+    if chain['status'] != 'PASS':
+        return {'status': 'FAIL', 'reason': chain['reason'], 'wrapper_verification': chain, 'security': sec, 'executed_unprotected': False}
+
+    gradle_args = ['./gradlew', '--no-daemon', '--console=plain']
     if offline:
-        cmd.append('--offline')
-    cmd.append(gradle_task)
+        gradle_args.append('--offline')
+    gradle_args.append(gradle_task)
 
-    try:
-        proc = subprocess.run(cmd, cwd=root, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return {'status': 'FAIL', 'reason': f'gradle build timed out after {timeout}s', 'command': cmd}
+    sandbox_res = run_in_bwrap_sandbox(
+        root,
+        gradle_args,
+        timeout=timeout,
+        allow_network=allow_network,
+        extract_outputs_to_host=True,
+        sandbox_available_override=sandbox_available_override,
+    )
+    if sandbox_res['status'] == 'BLOCKED' or sandbox_res.get('returncode') is None:
+        return {
+            'status': sandbox_res['status'],
+            'reason': sandbox_res['reason'],
+            'command': sandbox_res.get('sandbox_command', []),
+            'wrapper_verification': chain,
+            'sandbox': sandbox_res.get('sandbox'),
+            'executed_unprotected': False,
+            'apk_inspection': None,
+        }
 
-    log_out = sanitize_text((proc.stdout or '') + '\n' + (proc.stderr or ''), redact_home=False)
-    if proc.returncode != 0:
+    log_out = sanitize_text((sandbox_res.get('stdout') or '') + '\n' + (sandbox_res.get('stderr') or ''), redact_home=False)
+    cmd = sandbox_res['sandbox_command']
+    if sandbox_res['returncode'] != 0:
         return {
             'status': 'FAIL',
-            'reason': f'gradlew exited {proc.returncode}',
+            'reason': f'gradlew exited {sandbox_res["returncode"]}',
             'command': cmd,
+            'wrapper_verification': chain,
+            'sandbox': sandbox_res['sandbox'],
+            'executed_unprotected': False,
             'log_tail': log_out.splitlines()[-40:],
         }
 
@@ -516,11 +966,16 @@ def build_debug_apk(
     parts = [p for p in gradle_task.split(':') if p]
     module_dir = root.joinpath(*parts[:-1]) if len(parts) > 1 else root
     apks = sorted(module_dir.glob('build/outputs/apk/**/*.apk'))
+    if not apks and sandbox_res.get('collected_apks'):
+        apks = sorted(Path(p) for p in sandbox_res['collected_apks'])
     if not apks:
         return {
             'status': 'FAIL',
             'reason': 'gradlew exited 0 but no .apk artifact was produced under build/outputs/apk',
             'command': cmd,
+            'wrapper_verification': chain,
+            'sandbox': sandbox_res['sandbox'],
+            'executed_unprotected': False,
             'log_tail': log_out.splitlines()[-25:],
         }
 
@@ -531,6 +986,9 @@ def build_debug_apk(
         'command': cmd,
         'apk_path': str(apk_path),
         'apk_inspection': inspection,
+        'wrapper_verification': chain,
+        'sandbox': sandbox_res['sandbox'],
+        'executed_unprotected': False,
         'log_tail': log_out.splitlines()[-25:],
     }
 
@@ -807,7 +1265,7 @@ def run_git_bisect_regression(
         return {'status': 'FAIL', 'error': f'not a git repository: {src}'}
     sec = audit_untrusted_pr_or_repo(src)
     if sec['status'] == 'FAIL':
-        return {'status': 'FAIL', 'error': 'refusing bisect on repo failing security audit', 'security': sec}
+        return {'status': 'FAIL', 'error': 'refusing bisect on repo failing security audit', 'security': sec, 'executed_unprotected': False}
 
     try:
         commits_raw = subprocess.check_output(
@@ -823,32 +1281,55 @@ def run_git_bisect_regression(
         return {'status': 'INCONCLUSIVE', 'error': 'revision range contains fewer than 2 commits'}
 
     tested_steps: list[dict[str, Any]] = []
+
+    class _UnsafeBisectCommit(RuntimeError):
+        def __init__(self, rev: str, sec_res: dict[str, Any]) -> None:
+            super().__init__(rev)
+            self.rev = rev
+            self.sec_res = sec_res
+
     with tempfile.TemporaryDirectory(prefix='nox-bisect-') as tmp:
         wt = Path(tmp) / 'clone'
-        subprocess.run(['git', 'clone', '--quiet', '--no-hardlinks', str(src), str(wt)], check=True)
+        subprocess.run(
+            ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.file.allow=user', 'clone', '--quiet', '--no-hardlinks', '--no-recurse-submodules', str(src), str(wt)],
+            check=True,
+        )
 
         def _eval_idx(i: int) -> bool:
             rev = commits[i]
-            subprocess.run(['git', 'checkout', '--quiet', '--detach', rev], cwd=wt, check=True)
+            subprocess.run(['git', '-c', 'core.hooksPath=/dev/null', 'checkout', '--quiet', '--detach', rev], cwd=wt, check=True)
+            sec_rev = audit_untrusted_pr_or_repo(wt)
+            if sec_rev['status'] == 'FAIL':
+                raise _UnsafeBisectCommit(rev, sec_rev)
             passed = bool(test_fn(wt))
             tested_steps.append({'index': i, 'commit': rev, 'passed': passed})
             return passed
 
-        if not _eval_idx(0):
-            return {'status': 'FAIL', 'error': 'good_rev already failed test_fn', 'steps': tested_steps}
-        if _eval_idx(len(commits) - 1):
-            return {'status': 'INCONCLUSIVE', 'error': 'bad_rev did not fail test_fn', 'steps': tested_steps}
+        try:
+            if not _eval_idx(0):
+                return {'status': 'FAIL', 'error': 'good_rev already failed test_fn', 'steps': tested_steps}
+            if _eval_idx(len(commits) - 1):
+                return {'status': 'INCONCLUSIVE', 'error': 'bad_rev did not fail test_fn', 'steps': tested_steps}
 
-        lo, hi = 0, len(commits) - 1
-        while lo + 1 < hi:
-            mid = (lo + hi) // 2
-            if _eval_idx(mid):
-                lo = mid
-            else:
-                hi = mid
+            lo, hi = 0, len(commits) - 1
+            while lo + 1 < hi:
+                mid = (lo + hi) // 2
+                if _eval_idx(mid):
+                    lo = mid
+                else:
+                    hi = mid
+        except _UnsafeBisectCommit as exc:
+            return {
+                'status': 'FAIL',
+                'error': f'commit {exc.rev} failed security pre-flight; refusing test_fn execution',
+                'commit': exc.rev,
+                'security': exc.sec_res,
+                'steps': tested_steps,
+                'executed_unprotected': False,
+            }
 
         culprit = commits[hi]
-        subj = subprocess.check_output(['git', 'show', '-s', '--format=%s', culprit], cwd=wt, text=True).strip()
+        subj = subprocess.check_output(['git', '-c', 'core.hooksPath=/dev/null', 'show', '-s', '--format=%s', culprit], cwd=wt, text=True).strip()
         return {
             'status': 'PASS',
             'first_bad_commit': culprit,

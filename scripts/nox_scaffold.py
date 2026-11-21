@@ -6,16 +6,28 @@ from __future__ import annotations
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import re
 import tempfile
 import threading
-from typing import Any
+from typing import Any, Sequence
 from urllib.parse import parse_qs, urlsplit
 import urllib.request
 
-from nox_core import make_receipt, resolve_relative_url
-from nox_env import check_identity_continuity, compute_source_id, inspect_project
+from nox_core import (
+    detect_investigation_loop,
+    format_adaptive_response,
+    make_receipt,
+    resolve_relative_url,
+)
+from nox_env import (
+    check_identity_continuity,
+    compute_source_id,
+    inspect_project,
+    run_doctor,
+    search_existing_extensions,
+)
 from nox_lab import (
     analyze_site_dna,
     audit_anime_content,
@@ -520,3 +532,259 @@ def run_functional_scenarios(work_dir: Path | None = None) -> dict[str, Any]:
     finally:
         server.shutdown()
         server.server_close()
+
+
+def _infer_name_from_prompt(prompt_or_url: str, target_url: str | None) -> str:
+    """Derive a clean PascalCase extension name from URL hostname or request text."""
+    if target_url:
+        host = (urlsplit(target_url).hostname or '').lower()
+        host = re.sub(r'^www\.', '', host)
+        label = host.split('.')[0] if host else ''
+        if label and label not in {'example', 'localhost'}:
+            return _pascal(label)
+        if label:
+            return _pascal(label + 'Source')
+    words = [w for w in re.findall(r'[A-Za-z0-9]+', prompt_or_url) if len(w) >= 3 and w.lower() not in {'https', 'http', 'para', 'com', 'uma', 'extensao', 'extension', 'create', 'crie', 'manga', 'anime', 'novel', 'site'}]
+    return _pascal(words[-1]) if words else 'NoxAutoSource'
+
+
+def build_optional_adb_guide(ecosystem: str = 'keiyoushi', *, lang: str = 'pt-BR') -> dict[str, Any]:
+    """Explain optional Android device debugging without requiring technical knowledge or device resets."""
+    is_en = lang == 'en'
+    applicable = ecosystem in {'keiyoushi', 'yuzono'}
+    if not applicable:
+        return {
+            'required': False,
+            'applicable': False,
+            'summary': (
+                'LNReader plugins run without Android ADB or an Android phone.'
+                if is_en
+                else 'Plugins do LNReader nao usam ADB nem precisam de celular Android.'
+            ),
+            'steps': [],
+        }
+
+    steps = (
+        [
+            'Optional only: you can create and validate most fixes without a phone.',
+            'If you ever want to test directly on your Android phone, open Settings > About phone and tap Build number 7 times to unlock Developer options.',
+            'Inside Developer options, turn on USB debugging, connect the cable, and tap Allow on the phone popup.',
+            'Safety note: Nox only reads filtered logs from the target app — it never erases logs or uninstalls your apps.',
+        ]
+        if is_en
+        else [
+            'Etapa opcional: quase tudo e criado e validado sem precisar conectar celular.',
+            'Se quiser testar ao vivo no Android: abra Configuracoes > Sobre o telefone e toque 7 vezes em Numero da versao para ativar Opcoes do desenvolvedor.',
+            'Entre em Opcoes do desenvolvedor, ative a Depuracao USB, conecte o cabo e toque em Permitir no aviso do celular.',
+            'Garantia: a Nox apenas le eventos filtrados do app alvo; ela nunca apaga logs nem desinstala seus aplicativos.',
+        ]
+    )
+    return {
+        'required': False,
+        'applicable': True,
+        'summary': (
+            'Android device connection (ADB) is completely optional.'
+            if is_en
+            else 'Conexao com celular Android (ADB) e totalmente opcional.'
+        ),
+        'steps': steps,
+    }
+
+
+def _default_refs_cache() -> Path:
+    return Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'opencode/nox-workspace/nox-extension-developer'
+
+
+def auto_create_extension(
+    prompt_or_url: str,
+    *,
+    name: str | None = None,
+    ecosystem: str | None = None,
+    source_lang: str = 'pt-BR',
+    ui_lang: str = 'pt-BR',
+    output_dir: Path | str | None = None,
+    repo_root: Path | str | None = None,
+    build_task: str | None = None,
+    dry_run: bool = False,
+    technical: bool = False,
+) -> dict[str, Any]:
+    """Run automated beginner-first extension creation pipeline from a plain-language request or URL."""
+    import nox_android
+    import nox_issues
+    import references
+
+    parsed = nox_issues.parse_natural_language_request(prompt_or_url)
+    eco = ecosystem or parsed['inferred_ecosystem']
+    target_url = parsed.get('url') or 'https://example.invalid'
+    ext_name = _pascal(name) if name else _infer_name_from_prompt(prompt_or_url, parsed.get('url'))
+
+    doctor = run_doctor(ecosystem=eco)
+    ref_status = references.status(eco, _default_refs_cache())
+    existing = search_existing_extensions(repo_root, parsed.get('url') or ext_name) if repo_root and Path(repo_root).is_dir() else None
+    adb_guide = build_optional_adb_guide(eco, lang=ui_lang)
+
+    scaffold_res: dict[str, Any] | None = None
+    build_res: dict[str, Any] | None = None
+    if not dry_run and output_dir is not None:
+        scaffold_res = scaffold_extension(eco, ext_name, target_url, lang=source_lang, output_dir=Path(output_dir))
+    elif not dry_run:
+        with tempfile.TemporaryDirectory(prefix='nox-auto-preview-') as tmp:
+            scaffold_res = scaffold_extension(eco, ext_name, target_url, lang=source_lang, output_dir=Path(tmp) / 'ext')
+            scaffold_res['ephemeral_preview'] = True
+
+    if build_task and not dry_run:
+        build_target = Path(repo_root) if repo_root else (Path(output_dir) if output_dir else None)
+        if build_target and build_target.is_dir():
+            build_res = nox_android.build_debug_apk(build_target, build_task)
+
+    ambiguous_url = parsed.get('url') is None
+    if build_res and build_res.get('status') in {'BLOCKED', 'FAIL'}:
+        status = build_res['status']
+    elif ambiguous_url and dry_run:
+        status = 'INCONCLUSIVE'
+    else:
+        status = 'PASS'
+
+    is_en = ui_lang == 'en'
+    if status == 'PASS':
+        msg = (
+            f'Prepared {eco} extension template "{ext_name}" automatically for {target_url}.'
+            if is_en
+            else f'Estrutura inicial {eco} "{ext_name}" preparada automaticamente para {target_url}.'
+        )
+        nxt = (
+            'Provide an output folder (--output) or inspect the site HTML to verify catalog, search, and image loading.'
+            if is_en
+            else 'Informe uma pasta de destino (--output) ou inspecione a pagina do site para validar busca, capitulos e imagens.'
+        )
+    elif status == 'BLOCKED':
+        msg = (
+            f'Extension template "{ext_name}" is ready, while APK compilation stopped on a safety/sandbox requirement.'
+            if is_en
+            else f'Estrutura "{ext_name}" preparada, mas a compilacao foi bloqueada por requisito de seguranca ou sandbox.'
+        )
+        nxt = str((build_res or {}).get('reason') or 'Check local sandbox and SDK requirements.')
+    else:
+        msg = (
+            'Automatic preparation needs the website address (URL) to target the exact site structure.'
+            if is_en
+            else 'Preciso apenas do endereco do site (URL) para adaptar a fonte ao catalogo real.'
+        )
+        nxt = (
+            'Send the website URL (https://...) you want to support.'
+            if is_en
+            else 'Envie o link do site (https://...) que voce quer adicionar.'
+        )
+
+    payload = {
+        'status': status,
+        'action': 'auto_create',
+        'ecosystem': eco,
+        'extension_name': ext_name,
+        'target_url': target_url,
+        'user_message': msg,
+        'next_step': nxt,
+        'parsed_request': parsed,
+        'environment': doctor,
+        'reference_snapshot': ref_status,
+        'existing_search': existing,
+        'scaffold': scaffold_res,
+        'sandbox_build': build_res,
+        'optional_adb_guide': adb_guide,
+    }
+    return format_adaptive_response(payload, technical=technical, lang=ui_lang)
+
+
+def auto_fix_extension(
+    target: Path | str,
+    symptom: str,
+    *,
+    ecosystem: str | None = None,
+    ui_lang: str = 'pt-BR',
+    attempts: Sequence[dict[str, Any]] = (),
+    build_task: str | None = None,
+    technical: bool = False,
+) -> dict[str, Any]:
+    """Run automated diagnosis, loop-detection, security guard, and adaptive repair guidance."""
+    import nox_android
+    import nox_issues
+    import references
+
+    tpath = Path(target)
+    diag = nox_issues.diagnose_and_suggest_fix_from_issues(tpath, symptom, ecosystem=ecosystem)
+    eco = diag['ecosystem']
+    doctor = run_doctor(ecosystem=eco, check_path=tpath if tpath.is_dir() else None)
+    ref_status = references.status(eco, _default_refs_cache())
+    sec = nox_android.audit_untrusted_pr_or_repo(tpath) if tpath.is_dir() else None
+    loop = detect_investigation_loop(attempts)
+    adb_status = nox_android.adb_doctor() if eco in {'keiyoushi', 'yuzono'} else {'status': 'NOT_RUN', 'devices': []}
+    adb_guide = build_optional_adb_guide(eco, lang=ui_lang)
+
+    build_res: dict[str, Any] | None = None
+    if build_task and tpath.is_dir():
+        build_res = nox_android.build_debug_apk(tpath, build_task)
+
+    if sec and sec['status'] == 'FAIL':
+        status = 'FAIL'
+    elif build_res and build_res.get('status') in {'BLOCKED', 'FAIL'}:
+        status = build_res['status']
+    else:
+        status = 'PASS' if diag.get('recommended_actions') else 'INCONCLUSIVE'
+
+    is_en = ui_lang == 'en'
+    top_action = (loop.get('recommended_alternatives') or diag.get('recommended_actions') or [''])[0]
+    if sec and sec['status'] == 'FAIL':
+        msg = (
+            'Stopped automatic repair because this repository contains unsafe build or script patterns.'
+            if is_en
+            else 'Parei o reparo automatico porque este projeto contem padroes inseguros em arquivos de build ou scripts.'
+        )
+        nxt = (
+            'Review the flagged security findings before opening or compiling this repository.'
+            if is_en
+            else 'Revise os alertas de seguranca antes de compilar ou executar este repositorio.'
+        )
+    elif loop['loop_detected']:
+        msg = (
+            'Detected repeated attempts without progress and switched to a different investigation strategy.'
+            if is_en
+            else 'Identifiquei tentativas repetidas sem progresso e mudei a estrategia de investigacao.'
+        )
+        nxt = top_action
+    elif build_res and build_res.get('status') == 'BLOCKED':
+        msg = (
+            'Diagnosis completed, and automatic build was safely paused because isolated sandbox execution is unavailable.'
+            if is_en
+            else 'Diagnostico concluido, mas a compilacao automatica foi bloqueada porque o sandbox isolado nao esta disponivel.'
+        )
+        nxt = str(build_res.get('reason') or 'Enable bubblewrap isolation before compiling.')
+    else:
+        msg = (
+            f'Analyzed {eco} issue automatically and prioritized verified repair steps.'
+            if is_en
+            else f'Analisei o problema em {eco} automaticamente e priorizei o caminho mais seguro de correcao.'
+        )
+        nxt = top_action or (
+            'Apply the prioritized fix cleanly and re-run functional verification.'
+            if is_en
+            else 'Aplique o ajuste recomendado e revalide busca, capitulos e imagens.'
+        )
+
+    payload = {
+        'status': status,
+        'action': 'auto_fix',
+        'ecosystem': eco,
+        'target': str(tpath),
+        'symptom': symptom,
+        'user_message': msg,
+        'next_step': nxt,
+        'diagnosis': diag,
+        'loop_detection': loop,
+        'security_preflight': sec,
+        'environment': doctor,
+        'reference_snapshot': ref_status,
+        'sandbox_build': build_res,
+        'optional_adb_status': adb_status,
+        'optional_adb_guide': adb_guide,
+    }
+    return format_adaptive_response(payload, technical=technical, lang=ui_lang)

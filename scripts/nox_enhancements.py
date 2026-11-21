@@ -1127,15 +1127,21 @@ def export_security_findings_sarif(findings: Sequence[dict[str, Any]]) -> dict[s
 
 
 def build_bwrap_sandbox_command(target_dir: Path | str, command: Sequence[str]) -> dict[str, Any]:
-    """1140: Detect OS sandbox availability (bwrap) and build network-isolated ro-bind invocation."""
-    bwrap = shutil.which('bwrap')
-    cmd_list = [
-        bwrap or 'bwrap', '--unshare-net', '--die-with-parent', '--ro-bind', '/usr', '/usr',
-        '--bind', str(Path(target_dir).resolve()), '/work', '--chdir', '/work', *command,
-    ]
+    """1140: Detect OS sandbox availability (bwrap) and build hardened network-isolated invocation."""
+    import nox_android
+
+    probe = nox_android.probe_bwrap_sandbox()
+    cmd_list = nox_android.build_bwrap_invocation(
+        target_dir,
+        command,
+        allow_network=False,
+        bwrap_bin=probe.get('bwrap_path'),
+    )
     return {
-        'status': 'PASS' if bwrap else 'BLOCKED',
-        'bwrap_installed': bool(bwrap),
+        'status': probe['status'],
+        'bwrap_installed': probe['bwrap_installed'],
+        'userns_supported': probe.get('userns_supported', False),
+        'reason': probe.get('reason', ''),
         'sandbox_command': cmd_list,
     }
 

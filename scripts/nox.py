@@ -55,10 +55,83 @@ def _emit(payload: dict[str, Any], *, as_json: bool = True, beginner: bool = Fal
             print(f"Detected issues ({len(payload['issues'])}): {', '.join(str(x) for x in payload['issues'][:5])}")
 
 
+class _TechnicalModeAction(argparse.Action):
+    """Enable full technical JSON output and disable simplified beginner prose mode."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
+        setattr(namespace, self.dest, True)
+        setattr(namespace, 'beginner', False)
+        setattr(namespace, 'json', True)
+
+
+def _attach_global_flags_recursive(parser: argparse.ArgumentParser, *, is_root: bool = False) -> None:
+    """Propagate global UI/mode flags into every subparser and nested subparser without breaking scaffold --lang."""
+    if not is_root:
+        existing = parser._option_string_actions
+        if '--json' not in existing:
+            parser.add_argument('--json', action='store_true', default=argparse.SUPPRESS, help='emit machine-readable JSON (default)')
+        if '--beginner' not in existing:
+            parser.add_argument('--beginner', action='store_true', default=argparse.SUPPRESS, help='emit short beginner-friendly summary')
+        if '--technical' not in existing:
+            parser.add_argument('--technical', nargs=0, action=_TechnicalModeAction, default=argparse.SUPPRESS, help='emit full technical JSON details')
+        if '--dry-run' not in existing:
+            parser.add_argument('--dry-run', action='store_true', default=argparse.SUPPRESS, help='inspect without modifying persistent files')
+        if '--lang' not in existing:
+            parser.add_argument('--lang', choices=['pt-BR', 'en'], default=argparse.SUPPRESS, help='output language for summaries')
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            seen: set[int] = set()
+            for sub_p in action.choices.values():
+                if id(sub_p) not in seen:
+                    seen.add(id(sub_p))
+                    _attach_global_flags_recursive(sub_p, is_root=False)
+
+
 def build_parser() -> argparse.ArgumentParser:
+    p = _build_raw_parser()
+    sub_action = next((a for a in p._actions if isinstance(a, argparse._SubParsersAction)), None)
+    if sub_action is not None:
+        au = sub_action.add_parser('auto', help='automatically route plain-language request or repair task')
+        au.add_argument('prompt', nargs='*', help='plain-language request or website URL')
+        au.add_argument('--target', type=Path, help='optional local extension path to diagnose/fix')
+        au.add_argument('--symptom', default='broken source or loading error', help='symptom description when repairing')
+        au.add_argument('--ecosystem', choices=['keiyoushi', 'yuzono', 'lnreader'])
+        au.add_argument('--name', help='optional extension name override')
+        au.add_argument('--output', type=Path, help='optional destination folder for scaffolded files')
+        au.add_argument('--repo', type=Path, help='optional repository root for duplicate/existing search')
+        au.add_argument('--build-task', help='optional Gradle task to run inside Bubblewrap sandbox')
+
+        ac = sub_action.add_parser('auto-create', help='beginner-first automated extension creation flow')
+        ac.add_argument('prompt', nargs='+', help='plain-language description or target website URL')
+        ac.add_argument('--ecosystem', choices=['keiyoushi', 'yuzono', 'lnreader'])
+        ac.add_argument('--name', help='optional extension name override')
+        ac.add_argument('--source-lang', default='pt-BR', help='extension source language (default: pt-BR)')
+        ac.add_argument('--output', type=Path, help='optional destination folder for scaffolded files')
+        ac.add_argument('--repo', type=Path, help='optional repository root')
+        ac.add_argument('--build-task', help='optional Gradle task to run inside Bubblewrap sandbox')
+
+        af = sub_action.add_parser('auto-fix', help='automated diagnosis, loop-detection, and adaptive repair guidance')
+        af.add_argument('target', type=Path, help='local extension directory or source file')
+        af.add_argument('--symptom', default='broken source or loading error', help='symptom or user complaint')
+        af.add_argument('--ecosystem', choices=['keiyoushi', 'yuzono', 'lnreader'])
+        af.add_argument('--build-task', help='optional Gradle task to compile in Bubblewrap sandbox')
+        af.add_argument('--attempts-json', type=Path, help='optional JSON file listing previous troubleshooting attempts')
+
+    _attach_global_flags_recursive(p, is_root=True)
+    return p
+
+
+def _build_raw_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog='nox', description='Nox Extension Developer local engineering CLI')
     p.add_argument('--json', action='store_true', default=True, help='emit machine-readable JSON (default)')
     p.add_argument('--beginner', action='store_true', help='emit short beginner-friendly summary')
+    p.add_argument('--technical', nargs=0, action=_TechnicalModeAction, default=False, help='emit full technical JSON details')
     p.add_argument('--lang', choices=['pt-BR', 'en'], default='pt-BR', help='output language for summaries')
     p.add_argument('--dry-run', action='store_true', help='inspect without modifying persistent files')
 
@@ -472,14 +545,123 @@ def main(argv: list[str] | None = None) -> int:
         _emit(res, as_json=args.json, beginner=args.beginner, lang=args.lang)
         return _exit_code_for_status(res['status'])
 
+    if cmd == 'auto':
+        prompt_str = ' '.join(args.prompt).strip()
+        lang = getattr(args, 'lang', 'pt-BR')
+        technical = bool(getattr(args, 'technical', False))
+        parsed = nox_issues.parse_natural_language_request(prompt_str) if prompt_str else {'intent': 'create'}
+        if args.target is not None:
+            res = nox_scaffold.auto_fix_extension(
+                args.target,
+                args.symptom,
+                ecosystem=args.ecosystem,
+                ui_lang=lang,
+                build_task=args.build_task,
+                technical=technical,
+            )
+        elif parsed.get('intent') == 'fix' and not prompt_str.startswith('http'):
+            res = {
+                **nox_core.format_adaptive_response(
+                    {
+                        'status': 'INCONCLUSIVE',
+                        'action': 'auto',
+                        'ecosystem': args.ecosystem or parsed.get('inferred_ecosystem'),
+                        'user_message': (
+                            'To automatically diagnose and fix a broken extension, tell me its folder or file (--target).'
+                            if lang == 'en'
+                            else 'Para diagnosticar e corrigir uma extensao quebrada automaticamente, informe a pasta ou arquivo dela (--target).'
+                        ),
+                        'next_step': (
+                            'Send the extension name/folder or describe what stops working (search, chapters, or images).'
+                            if lang == 'en'
+                            else 'Envie a pasta/arquivo da extensao ou descreva o problema (busca, capitulos ou imagens).'
+                        ),
+                        'parsed_request': parsed,
+                    },
+                    technical=technical,
+                    lang=lang,
+                )
+            }
+        else:
+            res = nox_scaffold.auto_create_extension(
+                prompt_str or 'Create extension',
+                name=args.name,
+                ecosystem=args.ecosystem,
+                ui_lang=lang,
+                output_dir=args.output,
+                repo_root=args.repo,
+                build_task=args.build_task,
+                dry_run=bool(getattr(args, 'dry_run', False)),
+                technical=technical,
+            )
+        _emit(res, as_json=args.json, beginner=args.beginner, lang=lang)
+        return _exit_code_for_status(res['status'])
+
+    if cmd == 'auto-create':
+        lang = getattr(args, 'lang', 'pt-BR')
+        technical = bool(getattr(args, 'technical', False))
+        res = nox_scaffold.auto_create_extension(
+            ' '.join(args.prompt),
+            name=args.name,
+            ecosystem=args.ecosystem,
+            source_lang=args.source_lang,
+            ui_lang=lang,
+            output_dir=args.output,
+            repo_root=args.repo,
+            build_task=args.build_task,
+            dry_run=bool(getattr(args, 'dry_run', False)),
+            technical=technical,
+        )
+        _emit(res, as_json=args.json, beginner=args.beginner, lang=lang)
+        return _exit_code_for_status(res['status'])
+
+    if cmd == 'auto-fix':
+        lang = getattr(args, 'lang', 'pt-BR')
+        technical = bool(getattr(args, 'technical', False))
+        attempts: list[dict[str, Any]] = []
+        if args.attempts_json and args.attempts_json.is_file():
+            loaded = json.loads(args.attempts_json.read_text(encoding='utf-8'))
+            if isinstance(loaded, list):
+                attempts = [x for x in loaded if isinstance(x, dict)]
+        res = nox_scaffold.auto_fix_extension(
+            args.target,
+            args.symptom,
+            ecosystem=args.ecosystem,
+            ui_lang=lang,
+            attempts=attempts,
+            build_task=args.build_task,
+            technical=technical,
+        )
+        _emit(res, as_json=args.json, beginner=args.beginner, lang=lang)
+        return _exit_code_for_status(res['status'])
+
     if cmd == 'bisect':
         parts = shlex.split(args.test_cmd)
-        res = nox_android.run_git_bisect_regression(
-            args.repo,
-            args.good,
-            args.bad,
-            lambda wt: subprocess.run(parts, cwd=wt, capture_output=True).returncode == 0,
-        )
+        sandbox_blocked: dict[str, Any] = {}
+
+        def _sandboxed_bisect_check(wt: Path) -> bool:
+            sb = nox_android.run_in_bwrap_sandbox(wt, parts, timeout=60)
+            if sb['status'] == 'BLOCKED' or sb.get('returncode') is None:
+                sandbox_blocked['result'] = {
+                    'status': 'BLOCKED',
+                    'reason': sb.get('reason', 'bwrap sandbox unavailable for bisect --test-cmd'),
+                    'sandbox': sb.get('sandbox'),
+                    'executed_unprotected': False,
+                }
+                raise RuntimeError('NOX_BISECT_SANDBOX_BLOCKED')
+            return sb['returncode'] == 0
+
+        try:
+            res = nox_android.run_git_bisect_regression(
+                args.repo,
+                args.good,
+                args.bad,
+                _sandboxed_bisect_check,
+            )
+        except RuntimeError as exc:
+            if str(exc) != 'NOX_BISECT_SANDBOX_BLOCKED' or 'result' not in sandbox_blocked:
+                raise
+            res = sandbox_blocked['result']
         _emit(res, as_json=args.json, beginner=args.beginner, lang=args.lang)
         return _exit_code_for_status(res['status'])
 
