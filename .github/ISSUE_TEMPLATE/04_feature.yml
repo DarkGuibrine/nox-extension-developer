@@ -1,0 +1,32 @@
+name: "✨ Funcionalidade (Feature Request)"
+description: "Quer sugerir uma nova função para a skill? (Want to suggest a new feature for the skill?)"
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: feature-idea
+    attributes:
+      label: "Qual funcionalidade você gostaria de adicionar? (What feature would you like to add?)"
+      description: "Descreva sua ideia com suas palavras. (Describe your idea in your own words.)"
+      placeholder: "Gostaria que a skill pudesse detectar automaticamente extensões desatualizadas. (I'd like the skill to detect outdated extensions automatically.)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: feature-benefit
+    attributes:
+      label: "Como ela ajudaria? (How would it help?)"
+      placeholder: "Evitaria ter que verificar cada extensão manualmente. (It would avoid checking each extension manually.)"
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-info
+    attributes:
+      label: "Informações adicionais (Additional information)"
+    validations:
+      required: false
+
+  - type: markdown
+    attributes:
+      value: "Encontrou uma falha de segurança? Utilize o canal privado de segurança do repositório. (Found a security vulnerability? Use the repository's private security reporting channel.)"

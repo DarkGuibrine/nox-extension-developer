@@ -1,0 +1,66 @@
+name: "🔧 Compatibilidade (Compatibility)"
+description: "A skill apresentou problemas com algum aplicativo, sistema ou ferramenta? (Having trouble with an application, system or tool?)"
+labels:
+  - compatibility
+body:
+  - type: dropdown
+    id: ai-app
+    attributes:
+      label: "Qual aplicativo de IA você utiliza? (Which AI application do you use?)"
+      options:
+        - "OpenCode"
+        - "Antigravity"
+        - "Codex"
+        - "Claude Code"
+        - "Outro / Other"
+        - "Não sei / I don't know"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: operating-system
+    attributes:
+      label: "Qual sistema operacional você utiliza? (Which operating system do you use?)"
+      options:
+        - "Windows"
+        - "Linux"
+        - "macOS"
+        - "Outro / Other"
+        - "Não sei / I don't know"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: problem-area
+    attributes:
+      label: "Onde está o problema? (Where is the problem?)"
+      options:
+        - "Instalação / Installation"
+        - "Carregamento da skill / Skill loading"
+        - "Criação ou correção / Creation or repair"
+        - "Compilação / Build"
+        - "Dependências / Dependencies"
+        - "Outro / Other"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem-description
+    attributes:
+      label: "Explique o problema (Describe the problem)"
+      description: "Conte o que aconteceu com suas palavras. (Tell us what happened in your own words.)"
+      placeholder: "A skill não carregou no aplicativo de IA ou mostrou erro ao iniciar. (The skill did not load in the AI app or showed an error when starting.)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-info
+    attributes:
+      label: "Informações adicionais (Additional information)"
+      description: "Se quiser, inclua mensagens de erro ou capturas de tela. (Optionally include error messages or screenshots.)"
+    validations:
+      required: false
+
+  - type: markdown
+    attributes:
+      value: "Encontrou uma falha de segurança? Utilize o canal privado de segurança do repositório. (Found a security vulnerability? Use the repository's private security reporting channel.)"

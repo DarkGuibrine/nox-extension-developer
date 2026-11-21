@@ -1,0 +1,56 @@
+name: "🐛 Bug / Erro (Bug / Error)"
+description: "Encontrou algum problema na skill? Conte o que aconteceu. (Found a problem with the skill? Tell us what happened.)"
+labels:
+  - bug
+body:
+  - type: dropdown
+    id: problem-area
+    attributes:
+      label: "Onde aconteceu o problema? (Where did the problem happen?)"
+      options:
+        - "Instalação / Installation"
+        - "Atualização / Update"
+        - "Criação de extensão / Extension creation"
+        - "Correção de extensão / Extension repair"
+        - "Compilação de APK / APK build"
+        - "ADB ou testes Android / ADB or Android testing"
+        - "Outro / Other"
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: "O que aconteceu? (What happened?)"
+      description: "Explique o problema com suas palavras. (Describe the problem in your own words.)"
+      placeholder: "Pedi para criar uma extensão, mas a IA terminou sem entregar o APK. (I asked the AI to create an extension, but it finished without delivering the APK.)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: "O que você esperava? (What did you expect?)"
+      placeholder: "Esperava receber a extensão pronta. (I expected to receive the finished extension.)"
+    validations:
+      required: false
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: "Como o problema aconteceu? (How can we reproduce it?)"
+      placeholder: "Pedi para corrigir uma extensão, a IA analisou o código e depois parou. (I asked the AI to fix an extension, it analyzed the code and then stopped.)"
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-info
+    attributes:
+      label: "Informações adicionais (Additional information)"
+      description: "Se quiser, informe a versão da skill, o aplicativo de IA utilizado, mensagens de erro ou capturas de tela. (Optionally include the skill version, AI application, error messages or screenshots.)"
+    validations:
+      required: false
+
+  - type: markdown
+    attributes:
+      value: "Encontrou uma falha de segurança? Utilize o canal privado de segurança do repositório. (Found a security vulnerability? Use the repository's private security reporting channel.)"

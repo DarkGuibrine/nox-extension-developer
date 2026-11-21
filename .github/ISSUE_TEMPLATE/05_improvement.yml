@@ -1,0 +1,48 @@
+name: "💡 Melhoria (Improvement)"
+description: "Tem uma ideia para melhorar algo que já existe? (Have an idea to improve something that already exists?)"
+labels:
+  - enhancement
+body:
+  - type: dropdown
+    id: improvement-area
+    attributes:
+      label: "O que você gostaria de melhorar? (What would you like to improve?)"
+      options:
+        - "Instalação / Installation"
+        - "Criação de extensões / Extension creation"
+        - "Correção de extensões / Extension repair"
+        - "Testes e diagnósticos / Tests and diagnostics"
+        - "APK e Android / APK and Android"
+        - "Facilidade de uso / Ease of use"
+        - "Desempenho / Performance"
+        - "Outro / Other"
+    validations:
+      required: true
+
+  - type: textarea
+    id: improvement-suggestion
+    attributes:
+      label: "Qual melhoria você sugere? (What improvement do you suggest?)"
+      description: "Conte o que poderia ficar mais simples, rápido ou claro. (Tell us what could be simpler, faster or clearer.)"
+      placeholder: "Gostaria que a skill fizesse menos perguntas e concluísse as tarefas automaticamente. (I'd like the skill to ask fewer questions and complete tasks automatically.)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: improvement-why
+    attributes:
+      label: "Por que essa melhoria seria útil? (Why would this improvement be useful?)"
+      placeholder: "Deixaria o uso mais rápido no dia a dia. (It would make everyday use faster.)"
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-info
+    attributes:
+      label: "Informações adicionais (Additional information)"
+    validations:
+      required: false
+
+  - type: markdown
+    attributes:
+      value: "Encontrou uma falha de segurança? Utilize o canal privado de segurança do repositório. (Found a security vulnerability? Use the repository's private security reporting channel.)"
