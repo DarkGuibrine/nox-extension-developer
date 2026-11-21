@@ -1,0 +1,48 @@
+name: "📚 Documentação (Documentation)"
+description: "Encontrou algo errado ou difícil de entender na documentação? (Found something incorrect or confusing in the documentation?)"
+title: "[Documentação] "
+labels:
+  - documentation
+body:
+  - type: dropdown
+    id: doc-location
+    attributes:
+      label: "Onde encontrou o problema? (Where did you find the problem?)"
+      options:
+        - "README em português / Portuguese README"
+        - "README em inglês / English README"
+        - "Guia de instalação / Installation guide"
+        - "Guia de utilização / Usage guide"
+        - "Outros documentos / Other documentation"
+        - "Não sei / I don't know"
+    validations:
+      required: true
+
+  - type: textarea
+    id: doc-issue
+    attributes:
+      label: "O que está errado ou confuso? (What is incorrect or confusing?)"
+      description: "Conte o que não ficou claro ou o que parece estar errado. (Tell us what was unclear or seems wrong.)"
+      placeholder: "Não entendi como atualizar a skill. (I couldn't understand how to update the skill.)"
+    validations:
+      required: true
+
+  - type: input
+    id: page-link
+    attributes:
+      label: "Link da página (Page link)"
+      placeholder: "https://github.com/ProjectNox-org/nox-extension-developer/..."
+    validations:
+      required: false
+
+  - type: textarea
+    id: suggestions
+    attributes:
+      label: "Alguma sugestão? (Any suggestions?)"
+      description: "Opcional. Você não precisa saber como corrigir o texto. (Optional. You don't need to know how to fix the text.)"
+    validations:
+      required: false
+
+  - type: markdown
+    attributes:
+      value: "🔒 Encontrou uma falha de segurança? Envie seu relato pelo [canal privado de segurança](https://github.com/ProjectNox-org/nox-extension-developer/security/advisories/new). (Found a security vulnerability? Submit your report through the [private security reporting channel](https://github.com/ProjectNox-org/nox-extension-developer/security/advisories/new).)"
