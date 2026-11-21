@@ -157,16 +157,22 @@ python3 scripts/nox.py adb ui-plan --package app.mihon --source Source --query Q
 python3 scripts/nox.py adb filter-logcat <log.txt> --package eu.kanade.tachiyomi.extension.en.example
 python3 scripts/nox.py enhance --audit-source <source.kt> --ecosystem keiyoushi
 python3 scripts/nox.py bisect <repo> <good> <bad> --test-cmd "pytest -q"
+python3 scripts/nox.py auto "<request-or-url>" --json
+python3 scripts/nox.py auto-create "<request-or-url>" --output <dir>
+python3 scripts/nox.py auto-fix <target> --symptom "<error>"
+python3 scripts/nox.py build <repo> <gradle-task>
 python3 scripts/nox.py benchmark
 python3 scripts/nox.py matrix --validate
 ```
 
-### Quick guide: Debug APK, USB/Wi-Fi ADB & sanitized Logcat
+> Global flags such as `--json`, `--beginner`, `--technical`, `--dry-run`, and `--lang` (except where `--lang` selects the extension language in `scaffold`) work **before or after** any subcommand (e.g., `nox.py doctor --json` or `nox.py --json doctor`).
 
-1. **Debug build:** always use the target repository's Gradle Wrapper (e.g., `./gradlew :src:en:example:assembleDebug`), after running `nox.py security-audit` on any untrusted external repo/PR.
+### Quick guide: Sandboxed Build, Debug APK, Optional USB/Wi-Fi ADB & Sanitized Logcat
+
+1. **Isolated Debug build (`bwrap` fail-closed):** run `python3 scripts/nox.py build <repo> <task>` (e.g., `:src:en:example:assembleDebug`). Before running any build tool, the CLI verifies the Gradle Wrapper script, strict HTTPS distribution host + SHA-256 checksum, and `gradle-wrapper.jar` (`verify_gradle_execution_chain`), and runs inside an ephemeral Bubblewrap sandbox (`bwrap --unshare-all --clearenv`) without network, `$HOME`, or credentials. If Bubblewrap is unavailable, the build fails closed with `BLOCKED` and never falls back to host execution.
 2. **APK inspection:** run `python3 scripts/nox.py apk-inspect <path.apk>` to verify package name, `versionCode`, SHA-256, and signing certificate (`Debug` vs `Release`). A Debug APK cannot upgrade an existing APK signed with a different key without explicit user consent; the skill **never** uninstalls apps automatically.
-3. **ADB connection (USB or Wi-Fi):**
-   - Enable **Developer Options** and **USB Debugging** (or **Wireless Debugging** on Android 11+, pairing via `adb pair <ip:port>` — never paste pairing codes into logs).
+3. **Optional ADB connection (USB or Wi-Fi):** not required for creating sources or checking catalogs, search, chapters, and images.
+   - If you ever choose to test live on a phone: enable **Developer Options** and **USB Debugging** (or **Wireless Debugging** on Android 11+, pairing via `adb pair <ip:port>` — never paste pairing codes into logs).
    - Run `python3 scripts/nox.py adb doctor`. With multiple devices, pass `--serial <id>`. If `unauthorized`, accept the RSA prompt on the device screen.
 4. **Safe Logcat capture:** capture logs during the reproduction window without clearing existing buffers (`adb logcat -d -v threadtime > /tmp/nox-logcat.txt`) and isolate by package/PID via `python3 scripts/nox.py adb filter-logcat /tmp/nox-logcat.txt --package <pkg>`. The filter automatically redacts tokens/cookies and ignores `AndroidRuntime` crashes from unrelated packages. `NoxExt` is an optional diagnostic tag convention, not a guaranteed native Mihon tag.
 5. **No device attached:** when `adb devices` is empty, device checks are reported honestly as `NOT_RUN` (or `BLOCKED`), never as `PASS`.

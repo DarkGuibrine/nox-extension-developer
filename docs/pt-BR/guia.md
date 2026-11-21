@@ -157,16 +157,22 @@ python3 scripts/nox.py adb ui-plan --package app.mihon --source Fonte --query Bu
 python3 scripts/nox.py adb filter-logcat <log.txt> --package eu.kanade.tachiyomi.extension.pt.exemplo
 python3 scripts/nox.py enhance --audit-source <arquivo.kt> --ecosystem keiyoushi
 python3 scripts/nox.py bisect <repo> <good> <bad> --test-cmd "pytest -q"
+python3 scripts/nox.py auto "<pedido-ou-url>" --json
+python3 scripts/nox.py auto-create "<pedido-ou-url>" --output <pasta>
+python3 scripts/nox.py auto-fix <alvo> --symptom "<erro>"
+python3 scripts/nox.py build <repo> <gradle-task>
 python3 scripts/nox.py benchmark
 python3 scripts/nox.py matrix --validate
 ```
 
-### Guia rápido: APK Debug, USB/Wi-Fi ADB e coleta de logs
+> Flags globais como `--json`, `--beginner`, `--technical`, `--dry-run` e `--lang` (exceto quando `--lang` define o idioma da extensão em `scaffold`) podem ser informadas **antes ou depois** dos subcomandos (ex.: `nox.py doctor --json` ou `nox.py --json doctor`).
 
-1. **Compilação Debug:** use sempre o Gradle Wrapper do repositório alvo (ex.: `./gradlew :src:pt:exemplo:assembleDebug`), nunca antes de auditar PRs externos com `nox.py security-audit`.
+### Guia rápido: Build isolado, APK Debug, USB/Wi-Fi ADB (opcional) e coleta de logs
+
+1. **Compilação Debug segura (`bwrap` fail-closed):** execute `python3 scripts/nox.py build <repo> <task>` (ex.: `:src:pt:exemplo:assembleDebug`). Antes de executar qualquer build Gradle, a CLI verifica wrapper/checksum SHA-256/`gradle-wrapper.jar` (`verify_gradle_execution_chain`) e isola a execução em cópia efêmera via Bubblewrap (`bwrap --unshare-all --clearenv`), sem acesso à rede, `$HOME` ou credenciais. Se `bwrap` estiver indisponível ou bloqueado no kernel, a etapa retorna `BLOCKED` sem executar nada no host.
 2. **Inspeção do APK:** execute `python3 scripts/nox.py apk-inspect <caminho.apk>` para conferir pacote, `versionCode`, SHA-256 e certificado (`Debug` vs `Release`). Um APK Debug não substitui uma instalação assinada com outra chave sem consentimento explícito; a skill **nunca** desinstala aplicativos automaticamente.
-3. **Conexão ADB (USB ou Wi-Fi):**
-   - Ative **Opções do desenvolvedor** e **Depuração USB** (ou **Depuração por Wi-Fi** no Android 11+, pareando via `adb pair <ip:porta>` — nunca compartilhe códigos de pareamento em logs).
+3. **Conexão ADB opcional (USB ou Wi-Fi):** não é necessária para criar fontes nem validar catálogo, busca, capítulos e imagens.
+   - Se desejar testar ao vivo no aparelho: ative **Opções do desenvolvedor** e **Depuração USB** (ou **Depuração por Wi-Fi** no Android 11+, pareando via `adb pair <ip:porta>` — nunca compartilhe códigos de pareamento em logs).
    - Rode `python3 scripts/nox.py adb doctor`. Se houver 2+ dispositivos, informe `--serial <id>`. Se aparecer `unauthorized`, aceite a chave RSA na tela do aparelho.
 4. **Coleta segura de Logcat:** capture logs apenas durante a janela de reprodução sem apagar o histórico existente (`adb logcat -d -v threadtime > /tmp/nox-logcat.txt`) e filtre por pacote/PID com `python3 scripts/nox.py adb filter-logcat /tmp/nox-logcat.txt --package <pacote>`. O filtro aplica redação automática de tokens/cookies e evita atribuir à extensão um crash (`AndroidRuntime`) de outro aplicativo. A tag `NoxExt` é apenas uma convenção opcional de diagnóstico, não um recurso nativo garantido do Mihon.
 5. **Ausência de dispositivo:** quando `adb devices` estiver vazio, o relatório marca o teste no aparelho como `NOT_RUN` (ou `BLOCKED`), sem falsos `PASS`.
