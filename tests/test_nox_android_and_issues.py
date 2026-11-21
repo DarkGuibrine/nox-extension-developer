@@ -70,7 +70,13 @@ class AndroidAndSecurityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cmd = nox_android.build_bwrap_invocation(tmp, ['echo', 'ok'])
             joined = ' '.join(cmd)
-            self.assertIn('--ro-bind /bin /bin', joined)
+            # /bin é diretório no NixOS e symlink para usr/bin no Ubuntu; ambos precisam
+            # aparecer no sandbox (como bind ou symlink), senão /bin/sh não resolve.
+            bin_path = Path('/bin')
+            if bin_path.is_symlink():
+                self.assertIn(f'--symlink {os.readlink(bin_path)} /bin', joined)
+            else:
+                self.assertIn('--ro-bind /bin /bin', joined)
             if Path('/nix/store').is_dir():
                 self.assertIn('--ro-bind /nix/store /nix/store', joined)
             self.assertEqual(cmd[-2:], ['echo', 'ok'])
