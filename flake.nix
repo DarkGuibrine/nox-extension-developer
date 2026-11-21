@@ -27,11 +27,11 @@
             else
               [ ];
           versionLine = lib.findFirst (
-            line: builtins.match "^## [0-9]+\\.[0-9]+\\.[0-9]+.*" line != null
+            line: builtins.match "^## [[]?[0-9]+[.][0-9]+[.][0-9]+[]]?.*" line != null
           ) null lines;
         in
         if versionLine != null then
-          builtins.head (builtins.match "^## ([0-9]+\\.[0-9]+\\.[0-9]+).*" versionLine)
+          builtins.head (builtins.match "^## [[]?([0-9]+[.][0-9]+[.][0-9]+)[]]?.*" versionLine)
         else
           "0-unstable";
 
@@ -101,6 +101,9 @@
               --suffix PATH : "${
                 lib.makeBinPath (
                   [
+                    # Garante que subcomandos que reinvocam o interpretador
+                    # (`python3 ...`) usem o mesmo Python do pacote.
+                    pkgs.python3
                     pkgs.git
                     pkgs.nodejs
                   ]
@@ -239,58 +242,93 @@
         };
       });
 
-      checks = forAllSystems (pkgs: {
-        upstream-suite = pkgs.stdenvNoCC.mkDerivation {
-          pname = "nox-extension-developer-checks";
-          inherit version;
-          src = self;
-
-          nativeBuildInputs = [
-            pkgs.python3
-            pkgs.git
-            pkgs.nodejs
-          ];
-
-          postPatch = ''
-            # Compatibilidade com a sandbox de build do Nix (sem /usr/bin/python3 e com raiz em /build).
-            substituteInPlace tests/test_references.py \
-              --replace-quiet "/usr/bin/python3" "${pkgs.python3}/bin/python3"
-            substituteInPlace scripts/nox_android.py \
-              --replace-quiet "for part in gf.parts" "for part in gf.relative_to(root).parts" \
-              --replace-quiet "for part in sf.parts" "for part in sf.relative_to(root).parts"
+      checks = forAllSystems (
+        pkgs:
+        let
+          inherit (pkgs.stdenv.hostPlatform) system;
+          skill = self.packages.${system}.skill;
+          cli = self.packages.${system}.cli;
+        in
+        {
+          skill-layout = pkgs.runCommand "nox-extension-developer-skill-layout" { } ''
+            set -eu
+            for entry in SKILL.md scripts/nox.py references docs prompts assets; do
+              if [ ! -e "${skill}/$entry" ]; then
+                echo "skill package is missing required entry: $entry" >&2
+                exit 1
+              fi
+            done
+            if [ -n "$(find "${skill}" -type l -print -quit)" ]; then
+              echo "skill package must not contain symlinks" >&2
+              find "${skill}" -type l >&2
+              exit 1
+            fi
+            for forbidden in .git .github tests flake.nix flake.lock; do
+              if [ -e "${skill}/$forbidden" ]; then
+                echo "skill package must not ship build-only entry: $forbidden" >&2
+                exit 1
+              fi
+            done
+            touch "$out"
           '';
 
-          dontConfigure = true;
-          dontBuild = true;
-          doCheck = true;
-
-          checkPhase = ''
-            runHook preCheck
+          cli-smoke = pkgs.runCommand "nox-extension-developer-cli-smoke" { } ''
+            set -eu
             export HOME="$TMPDIR/home"
             export XDG_CACHE_HOME="$TMPDIR/cache"
             export PYTHONDONTWRITEBYTECODE=1
             mkdir -p "$HOME" "$XDG_CACHE_HOME"
 
-            python3 -c "import ast, pathlib; [ast.parse(p.read_bytes(), filename=str(p)) for d in ('scripts', 'tests') for p in pathlib.Path(d).glob('*.py')]"
-            python3 -m unittest discover -s tests -v
-            python3 scripts/nox.py matrix --validate
-            python3 scripts/nox.py scenarios
-            python3 scripts/nox.py benchmark
-            python3 scripts/nox.py security-audit .
-            python3 scripts/nox.py verify-report README.md
-            python3 scripts/nox.py verify-report README.en.md
-            python3 scripts/package.py "$TMPDIR/nox-ci-candidate.zip"
-            rm -f "$TMPDIR/nox-ci-candidate.zip"
-            runHook postCheck
+            ${lib.getExe cli} doctor --json > "$TMPDIR/doctor.json"
+            ${lib.getExe cli} matrix --validate
+            ${lib.getExe cli} scenarios
+            ${lib.getExe cli} security-audit ${self}
+            touch "$out"
           '';
 
-          installPhase = ''
-            runHook preInstall
-            touch "$out"
-            runHook postInstall
-          '';
-        };
-      });
+          upstream-suite = pkgs.stdenvNoCC.mkDerivation {
+            pname = "nox-extension-developer-checks";
+            inherit version;
+            src = self;
+
+            nativeBuildInputs = [
+              pkgs.python3
+              pkgs.git
+              pkgs.nodejs
+            ];
+
+            dontConfigure = true;
+            dontBuild = true;
+            doCheck = true;
+
+            checkPhase = ''
+              runHook preCheck
+              export HOME="$TMPDIR/home"
+              export XDG_CACHE_HOME="$TMPDIR/cache"
+              export PYTHONDONTWRITEBYTECODE=1
+              mkdir -p "$HOME" "$XDG_CACHE_HOME"
+
+              python3 -c "import ast, pathlib; [ast.parse(p.read_bytes(), filename=str(p)) for d in ('scripts', 'tests') for p in pathlib.Path(d).glob('*.py')]"
+              python3 -m unittest discover -s tests -v
+              python3 scripts/nox.py matrix --validate
+              python3 scripts/nox.py scenarios
+              python3 scripts/nox.py benchmark
+              python3 scripts/nox.py security-audit .
+              python3 scripts/nox.py verify-report README.md
+              python3 scripts/nox.py verify-report README.en.md
+              python3 scripts/package.py "$TMPDIR/nox-ci-candidate.zip"
+              rm -f "$TMPDIR/nox-ci-candidate.zip"
+              runHook postCheck
+            '';
+
+            installPhase = ''
+              runHook preInstall
+              touch "$out"
+              runHook postInstall
+            '';
+          };
+        }
+      );
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShellNoCC {
