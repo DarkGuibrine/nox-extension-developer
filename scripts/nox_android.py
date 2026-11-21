@@ -930,6 +930,8 @@ def build_debug_apk(
         gradle_args.append('--offline')
     gradle_args.append(gradle_task)
 
+    import time
+    build_started_at = time.time()
     sandbox_res = run_in_bwrap_sandbox(
         root,
         gradle_args,
@@ -962,12 +964,11 @@ def build_debug_apk(
             'log_tail': log_out.splitlines()[-40:],
         }
 
-    # Locate generated APK inside module path inferred from :src:lang:mod:assembleDebug
+    # Prefer freshly collected sandbox APK outputs matching module path before scanning host outputs
     parts = [p for p in gradle_task.split(':') if p]
     module_dir = root.joinpath(*parts[:-1]) if len(parts) > 1 else root
-    apks = sorted(module_dir.glob('build/outputs/apk/**/*.apk'))
-    if not apks and sandbox_res.get('collected_apks'):
-        apks = sorted(Path(p) for p in sandbox_res['collected_apks'])
+    collected = sorted(Path(p) for p in (sandbox_res.get('collected_apks') or []))
+    apks = [p for p in collected if str(p).startswith(str(module_dir))] or collected or sorted(module_dir.glob('build/outputs/apk/**/*.apk'))
     if not apks:
         return {
             'status': 'FAIL',
@@ -985,11 +986,517 @@ def build_debug_apk(
         'status': inspection['status'],
         'command': cmd,
         'apk_path': str(apk_path),
+        'build_started_at': build_started_at,
         'apk_inspection': inspection,
         'wrapper_verification': chain,
         'sandbox': sandbox_res['sandbox'],
         'executed_unprotected': False,
         'log_tail': log_out.splitlines()[-25:],
+    }
+
+
+def verify_and_offer_apk_delivery(
+    apk_path: Path | str | None,
+    *,
+    expected_package: str | None = None,
+    min_mtime: float | None = None,
+    lang: str = 'pt-BR',
+) -> dict[str, Any]:
+    """Verify a newly built Debug APK and prepare the 3 post-build user choices only when genuine."""
+    is_en = lang == 'en'
+    if not apk_path:
+        return {
+            'status': 'BLOCKED',
+            'apk_ready': False,
+            'reason': 'apk_missing',
+            'user_message': (
+                'No Debug APK was produced yet, so phone installation options are unavailable.'
+                if is_en
+                else 'Nenhum APK Debug foi gerado nesta etapa; as opcoes de entrega nao estao disponiveis.'
+            ),
+            'options': None,
+        }
+
+    p = Path(apk_path)
+    if p.is_symlink() or not p.is_file() or p.stat().st_size <= 0:
+        return {
+            'status': 'FAIL',
+            'apk_ready': False,
+            'reason': 'apk_missing_empty_or_symlink',
+            'user_message': (
+                'The APK artifact is missing or empty.'
+                if is_en
+                else 'O arquivo APK nao existe ou esta vazio.'
+            ),
+            'options': None,
+        }
+
+    if min_mtime is not None and (p.stat().st_mtime + 0.05) < float(min_mtime):
+        return {
+            'status': 'FAIL',
+            'apk_ready': False,
+            'reason': 'stale_apk_artifact',
+            'user_message': (
+                'Rejected an older APK file because it was not produced by the latest build.'
+                if is_en
+                else 'Descartei um arquivo APK antigo porque ele nao foi gerado pela compilacao mais recente.'
+            ),
+            'options': None,
+        }
+
+    insp = inspect_apk(p, expected_package=expected_package)
+    issues = insp.get('issues') or []
+    sig_failed = 'apk_signature_verification_failed' in issues or 'package_mismatch' in issues
+    if insp.get('status') == 'FAIL' or not insp.get('has_dex') or sig_failed:
+        return {
+            'status': 'FAIL',
+            'apk_ready': False,
+            'reason': 'apk_inspection_failed',
+            'apk_inspection': insp,
+            'user_message': (
+                'The compiled APK failed integrity or package verification.'
+                if is_en
+                else 'O APK gerado falhou na verificacao de integridade ou pacote.'
+            ),
+            'options': None,
+        }
+
+    options = (
+        [
+            {'id': 1, 'key': 'save', 'label': '1. Save to another folder'},
+            {'id': 2, 'key': 'adb', 'label': '2. Install and test on my phone'},
+            {'id': 3, 'key': 'keep', 'label': '3. Leave the APK where it is'},
+        ]
+        if is_en
+        else [
+            {'id': 1, 'key': 'save', 'label': '1. Salvar em outra pasta'},
+            {'id': 2, 'key': 'adb', 'label': '2. Instalar e testar no meu celular'},
+            {'id': 3, 'key': 'keep', 'label': '3. Deixar o APK onde está'},
+        ]
+    )
+    prompt = (
+        'What do you want to do with the APK?'
+        if is_en
+        else 'O que você quer fazer com o APK?'
+    )
+    return {
+        'status': 'PASS',
+        'apk_ready': True,
+        'apk_path': str(p.resolve()),
+        'apk_sha256': insp.get('sha256'),
+        'apk_package': (insp.get('metadata') or {}).get('package'),
+        'apk_inspection': insp,
+        'prompt': prompt,
+        'options': options,
+    }
+
+
+def run_guided_adb_install_and_test(
+    apk_path: Path | str,
+    *,
+    serial: str | None = None,
+    authorize_install: bool = False,
+    expected_package: str | None = None,
+    lang: str = 'pt-BR',
+    runner: Callable[[list[str]], tuple[int, str, str]] | None = None,
+    logcat_sample: str | None = None,
+) -> dict[str, Any]:
+    """Guide optional ADB device setup, require explicit install authorization, install non-destructively, and verify runtime logs."""
+    is_en = lang == 'en'
+    apk_p = Path(apk_path)
+    if apk_p.is_symlink() or not apk_p.is_file() or apk_p.stat().st_size <= 0:
+        return {
+            'status': 'FAIL',
+            'step': 'invalid_apk',
+            'installed': False,
+            'real_device_homologated': False,
+            'user_message': 'APK file is missing or invalid.' if is_en else 'O arquivo APK não existe ou é inválido.',
+        }
+
+    simulated_adb = runner is not None
+    adb_bin = 'adb' if simulated_adb else (shutil.which('adb') or _find_android_tool('adb'))
+    if not adb_bin:
+        return {
+            'status': 'BLOCKED',
+            'step': 'adb_missing',
+            'adb_present': False,
+            'installed': False,
+            'requires_tool_install_authorization': True,
+            'simulated_adb': False,
+            'real_device_homologated': False,
+            'user_message': (
+                'Android connection tool (ADB) is not installed on this computer. Can I guide or install it to test on your phone?'
+                if is_en
+                else 'A ferramenta de conexão com o celular (ADB) não está instalada neste computador. Posso orientar ou preparar a instalação?'
+            ),
+            'next_step': (
+                'Reply confirming whether you want help setting up ADB, or keep the APK on disk.'
+                if is_en
+                else 'Me confirme se quer instalar o suporte ao celular ou prefere manter o APK salvo no computador.'
+            ),
+        }
+
+    def _exec_adb(args: list[str], *, timeout: int = 30) -> tuple[int, str, str]:
+        if runner is not None:
+            return runner([adb_bin, *args])
+        proc = subprocess.run([adb_bin, *args], capture_output=True, text=True, timeout=timeout)
+        return proc.returncode, proc.stdout or '', proc.stderr or ''
+
+    try:
+        rc_dev, out_dev, err_dev = _exec_adb(['devices', '-l'], timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            'status': 'BLOCKED',
+            'step': 'adb_error',
+            'adb_present': True,
+            'installed': False,
+            'simulated_adb': simulated_adb,
+            'real_device_homologated': False,
+            'user_message': (
+                f'Could not talk to Android devices ({exc}).'
+                if is_en
+                else 'Não consegui verificar os celulares conectados agora.'
+            ),
+        }
+
+    if rc_dev != 0 and not out_dev.strip():
+        return {
+            'status': 'BLOCKED',
+            'step': 'adb_error',
+            'adb_present': True,
+            'installed': False,
+            'simulated_adb': simulated_adb,
+            'real_device_homologated': False,
+            'user_message': sanitize_text(err_dev or 'ADB failed to list devices.', redact_home=True),
+        }
+
+    devices = parse_adb_devices(out_dev)
+    ready = [d for d in devices if d['state'] == 'device']
+    unauthorized = [d for d in devices if d['state'] == 'unauthorized']
+    offline = [d for d in devices if d['state'] == 'offline']
+
+    onboarding_steps = (
+        [
+            'Step 1: Open Android Settings > About phone and tap Build number 7 times to enable Developer Options.',
+            'Step 2: Inside Developer Options, turn on USB Debugging.',
+            'Step 3: Connect your phone to this computer using a data USB cable.',
+            'Step 4: Tap Allow when the phone asks to trust this computer, then let me know.',
+        ]
+        if is_en
+        else [
+            'Passo 1: Abra Configurações > Sobre o telefone e toque 7 vezes em Número da versão para ativar as Opções do desenvolvedor.',
+            'Passo 2: Entre em Opções do desenvolvedor e ative a Depuração USB.',
+            'Passo 3: Conecte o celular ao computador com um cabo USB de dados.',
+            'Passo 4: Toque em Permitir quando o celular pedir autorização e me avise quando estiver conectado.',
+        ]
+    )
+
+    if not devices:
+        return {
+            'status': 'BLOCKED',
+            'step': 'connect_device',
+            'adb_present': True,
+            'devices': [],
+            'onboarding_steps': onboarding_steps,
+            'installed': False,
+            'simulated_adb': simulated_adb,
+            'real_device_homologated': False,
+            'user_message': (
+                'Turn on USB Debugging on your phone, connect the USB cable, accept the popup, and tell me when it is connected.'
+                if is_en
+                else 'Ative a Depuração USB nas configurações do celular, conecte com cabo USB, autorize na tela e me avise quando estiver conectado.'
+            ),
+            'next_step': '\n'.join(onboarding_steps),
+        }
+
+    if unauthorized and not ready:
+        return {
+            'status': 'BLOCKED',
+            'step': 'authorize_rsa',
+            'adb_present': True,
+            'devices': devices,
+            'installed': False,
+            'simulated_adb': simulated_adb,
+            'real_device_homologated': False,
+            'user_message': (
+                'I found your phone, but you need to tap Allow on the phone screen to authorize this computer.'
+                if is_en
+                else 'Encontrei o seu celular, mas falta tocar em Permitir na tela dele para autorizar a conexão.'
+            ),
+            'next_step': (
+                'Unlock your phone screen, tap Allow, and tell me so I can continue.'
+                if is_en
+                else 'Desbloqueie a tela do celular, toque em Permitir e me avise para continuar.'
+            ),
+        }
+
+    if offline and not ready:
+        return {
+            'status': 'BLOCKED',
+            'step': 'reconnect_cable',
+            'adb_present': True,
+            'devices': devices,
+            'installed': False,
+            'simulated_adb': simulated_adb,
+            'real_device_homologated': False,
+            'user_message': (
+                'The phone appeared as offline. Reconnect the USB cable or unlock the screen and try again.'
+                if is_en
+                else 'O celular apareceu como desconectado (offline). Reconecte o cabo USB e tente novamente.'
+            ),
+        }
+
+    if len(ready) > 1 and not serial:
+        return {
+            'status': 'INCONCLUSIVE',
+            'step': 'select_device',
+            'adb_present': True,
+            'available_devices': ready,
+            'installed': False,
+            'simulated_adb': simulated_adb,
+            'real_device_homologated': False,
+            'user_message': (
+                f"More than one phone or emulator is connected ({', '.join(d['serial'] for d in ready)}). Tell me which one to use."
+                if is_en
+                else f"Há mais de um aparelho conectado ({', '.join(d['serial'] for d in ready)}). Qual você quer usar?"
+            ),
+        }
+
+    target_dev = next((d for d in ready if d['serial'] == serial), None) if serial else ready[0]
+    if target_dev is None:
+        return {
+            'status': 'FAIL',
+            'step': 'device_not_found',
+            'adb_present': True,
+            'devices': devices,
+            'installed': False,
+            'simulated_adb': simulated_adb,
+            'real_device_homologated': False,
+            'user_message': (
+                f'Selected device {serial} is not ready.'
+                if is_en
+                else f'O aparelho selecionado ({serial}) não está disponível.'
+            ),
+        }
+
+    insp = inspect_apk(apk_p, expected_package=expected_package)
+    pkg = expected_package or (insp.get('metadata') or {}).get('package')
+
+    if not authorize_install:
+        return {
+            'status': 'BLOCKED',
+            'step': 'confirm_install',
+            'adb_present': True,
+            'selected_device': target_dev,
+            'target_package': pkg,
+            'requires_install_authorization': True,
+            'installed': False,
+            'simulated_adb': simulated_adb,
+            'real_device_homologated': False,
+            'user_message': (
+                f"Phone ready ({target_dev['serial']}). Can I install the extension APK{f' ({pkg})' if pkg else ''} on this device now?"
+                if is_en
+                else f"Celular pronto ({target_dev['serial']}). Posso instalar a extensão{f' ({pkg})' if pkg else ''} nele agora?"
+            ),
+        }
+
+    rc_inst, out_inst, err_inst = _exec_adb(['-s', target_dev['serial'], 'install', '-r', str(apk_p.resolve())], timeout=60)
+    combined_inst = (out_inst + '\n' + err_inst).strip()
+    if rc_inst != 0 or 'Failure' in combined_inst:
+        sig_conflict = 'INSTALL_FAILED_UPDATE_INCOMPATIBLE' in combined_inst or 'INSTALL_FAILED_VERSION_DOWNGRADE' in combined_inst
+        return {
+            'status': 'FAIL',
+            'step': 'install_failed',
+            'adb_present': True,
+            'selected_device': target_dev,
+            'target_package': pkg,
+            'installed': False,
+            'signature_conflict': sig_conflict,
+            'simulated_adb': simulated_adb,
+            'real_device_homologated': False,
+            'install_output': sanitize_text(combined_inst, redact_home=True),
+            'user_message': (
+                'Could not install this Debug APK because another version with a different signature or newer version is already installed. Nothing was uninstalled automatically.'
+                if (is_en and sig_conflict)
+                else (
+                    'Não consegui instalar este APK Debug porque já existe uma versão com assinatura diferente ou mais recente instalada no celular. Não desinstalei nada automaticamente.'
+                    if sig_conflict
+                    else (
+                        'Failed to install the extension on the phone.'
+                        if is_en
+                        else 'Não foi possível instalar a extensão no celular.'
+                    )
+                )
+            ),
+        }
+
+    pkg_verified = True
+    if pkg:
+        rc_pm, out_pm, _ = _exec_adb(['-s', target_dev['serial'], 'shell', 'pm', 'path', pkg], timeout=15)
+        pkg_verified = rc_pm == 0 and ('package:' in out_pm or not out_pm.strip())
+
+    raw_logcat = logcat_sample
+    if raw_logcat is None:
+        _, out_log, _ = _exec_adb(['-s', target_dev['serial'], 'logcat', '-d', '-v', 'threadtime'], timeout=20)
+        raw_logcat = out_log
+
+    filtered = parse_and_filter_logcat(raw_logcat or '', target_package=pkg)
+    if filtered['target_crashes']:
+        return {
+            'status': 'FAIL',
+            'step': 'post_install_crash_detected',
+            'adb_present': True,
+            'selected_device': target_dev,
+            'target_package': pkg,
+            'installed': True,
+            'package_verified': pkg_verified,
+            'needs_auto_fix_continuation': True,
+            'filtered_logcat': filtered,
+            'simulated_adb': simulated_adb,
+            'real_device_homologated': False,
+            'user_message': (
+                'Installed the extension, detected an error when opening it on the phone, and I am investigating the cause to fix it.'
+                if is_en
+                else 'Instalei a extensão no celular, identifiquei um erro ao executá-la e já vou analisar a causa para corrigir.'
+            ),
+        }
+
+    return {
+        'status': 'PASS',
+        'step': 'installed_and_checked',
+        'adb_present': True,
+        'selected_device': target_dev,
+        'target_package': pkg,
+        'installed': True,
+        'package_verified': pkg_verified,
+        'filtered_logcat': filtered,
+        'simulated_adb': simulated_adb,
+        'real_device_homologated': not simulated_adb,
+        'user_message': (
+            'Extension installed on your phone without runtime errors. Open the app and test catalog, chapters, and pages!'
+            if is_en
+            else 'Extensão instalada no celular sem erros nos registros recentes. Agora abra o aplicativo para testar catálogo, capítulos e carregamento!'
+        ),
+    }
+
+
+def handle_apk_delivery_choice(
+    apk_path: Path | str,
+    choice: str | int,
+    *,
+    destination: Path | str | None = None,
+    overwrite: bool = False,
+    serial: str | None = None,
+    authorize_install: bool = False,
+    expected_package: str | None = None,
+    lang: str = 'pt-BR',
+    adb_runner: Callable[[list[str]], tuple[int, str, str]] | None = None,
+    logcat_sample: str | None = None,
+) -> dict[str, Any]:
+    """Execute the user's post-build APK choice: (1) save copy, (2) optional ADB install/test, or (3) keep in place."""
+    is_en = lang == 'en'
+    apk_p = Path(apk_path)
+    if apk_p.is_symlink() or not apk_p.is_file() or apk_p.stat().st_size <= 0:
+        return {
+            'status': 'FAIL',
+            'action': 'apk_deliver',
+            'user_message': 'APK file is missing or empty.' if is_en else 'O arquivo APK não foi encontrado ou está vazio.',
+        }
+
+    norm = str(choice).strip().lower()
+    if norm in {'1', 'save', 'salvar', 'copy'}:
+        if destination is None:
+            return {
+                'status': 'INCONCLUSIVE',
+                'action': 'apk_deliver_save',
+                'needs_destination': True,
+                'user_message': (
+                    'Which folder do you want to save the APK to?'
+                    if is_en
+                    else 'Em qual pasta você deseja salvar o APK?'
+                ),
+            }
+        dest_raw = Path(destination).expanduser()
+        dst = (dest_raw / apk_p.name) if (dest_raw.is_dir() or dest_raw.suffix.lower() != '.apk') else dest_raw
+        # Guard against symlinks along destination path
+        if dst.is_symlink() or any(par.is_symlink() for par in dst.parents if par.exists()):
+            return {
+                'status': 'FAIL',
+                'action': 'apk_deliver_save',
+                'user_message': (
+                    'Refused saving to a symbolic link destination for safety.'
+                    if is_en
+                    else 'Recusei salvar nesse caminho por segurança (link simbólico detectado).'
+                ),
+            }
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists() and not overwrite:
+            return {
+                'status': 'BLOCKED',
+                'action': 'apk_deliver_save',
+                'requires_overwrite_authorization': True,
+                'existing_path': str(dst),
+                'user_message': (
+                    f'A file already exists at {dst}. Do you authorize overwriting it?'
+                    if is_en
+                    else f'Já existe um arquivo em {dst}. Posso substituí-lo?'
+                ),
+            }
+        shutil.copy2(apk_p, dst)
+        src_hash = hashlib.sha256(apk_p.read_bytes()).hexdigest()
+        dst_hash = hashlib.sha256(dst.read_bytes()).hexdigest()
+        if src_hash != dst_hash:
+            return {
+                'status': 'FAIL',
+                'action': 'apk_deliver_save',
+                'user_message': 'Copy verification failed.' if is_en else 'Falha ao confirmar a cópia do APK.',
+            }
+        return {
+            'status': 'PASS',
+            'action': 'apk_deliver_save',
+            'saved_path': str(dst.resolve()),
+            'original_apk': str(apk_p.resolve()),
+            'sha256': dst_hash,
+            'user_message': (
+                f'APK saved successfully to: {dst.resolve()}'
+                if is_en
+                else f'APK salvo com sucesso na pasta escolhida: {dst.resolve()}'
+            ),
+        }
+
+    if norm in {'2', 'adb', 'install', 'instalar', 'celular', 'phone'}:
+        res = run_guided_adb_install_and_test(
+            apk_p,
+            serial=serial,
+            authorize_install=authorize_install,
+            expected_package=expected_package,
+            lang=lang,
+            runner=adb_runner,
+            logcat_sample=logcat_sample,
+        )
+        return {**res, 'action': 'apk_deliver_adb'}
+
+    if norm in {'3', 'keep', 'manter', 'leave'}:
+        resolved = str(apk_p.resolve())
+        return {
+            'status': 'PASS',
+            'action': 'apk_deliver_keep',
+            'apk_path': resolved,
+            'user_message': (
+                f'All set! Your APK will stay saved at: {resolved}'
+                if is_en
+                else f'Perfeito! O APK continuará salvo em: {resolved}'
+            ),
+        }
+
+    return {
+        'status': 'INCONCLUSIVE',
+        'action': 'apk_deliver',
+        'user_message': (
+            'Choose 1 (save to folder), 2 (install on phone), or 3 (leave here).'
+            if is_en
+            else 'Escolha 1 (salvar em outra pasta), 2 (instalar no celular) ou 3 (manter onde está).'
+        ),
     }
 
 

@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import tempfile
 from typing import Any, Iterable, Sequence
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
@@ -541,13 +542,48 @@ def _plain_language_summary(result: dict[str, Any], lang: str) -> tuple[str, str
     return msg, nxt
 
 
+def build_agent_continuation(
+    *,
+    phase: str,
+    task_complete: bool,
+    status: str,
+    completed_gates: dict[str, str],
+    next_agent_action: str,
+) -> dict[str, Any]:
+    """Build deterministic continuation directive preventing agents from stopping at templates or diagnostics."""
+    must_continue = (not task_complete) and (status.upper() != 'BLOCKED')
+    return {
+        'task_complete': task_complete,
+        'must_continue_automatically': must_continue,
+        'current_phase': phase,
+        'completed_gates': completed_gates,
+        'next_agent_action': next_agent_action,
+        'do_not_ask_user': [
+            'Do not ask permission to inspect site, consult docs/issues, scaffold, implement selectors, run tests, fix errors, or compile in sandbox.',
+        ],
+    }
+
+
+def _persist_internal_diagnostics(result: dict[str, Any], diagnostics_dir: Path | str | None = None) -> Path:
+    """Persist full technical details in an internal file without exposing dumps in beginner answers."""
+    cand = diagnostics_dir or result.get('output_dir') or result.get('diagnostics_dir')
+    target_dir = Path(cand) if cand else None
+    if target_dir and target_dir.is_dir():
+        diag_path = target_dir / '.nox-diagnostics' / 'latest-report.json'
+    else:
+        diag_path = Path(tempfile.gettempdir()) / f'nox-diagnostics-{os.getpid()}.json'
+    atomic_write_text(diag_path, json.dumps(result, indent=2, ensure_ascii=False, default=str) + '\n')
+    return diag_path
+
+
 def format_adaptive_response(
     result: dict[str, Any],
     *,
     technical: bool = False,
     lang: str = 'pt-BR',
+    diagnostics_dir: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Return dual-layer output: jargon-free beginner guidance by default or full technical payload."""
+    """Return dual-layer output: clean beginner payload backed by an internal diagnostics file, or full technical JSON."""
     user_message, next_step = _plain_language_summary(result, lang)
     custom_msg = result.get('user_message')
     if isinstance(custom_msg, str) and custom_msg.strip():
@@ -557,6 +593,8 @@ def format_adaptive_response(
         next_step = custom_next.strip()
 
     status = str(result.get('status') or 'INCONCLUSIVE').upper()
+    diag_path = _persist_internal_diagnostics(result, diagnostics_dir=diagnostics_dir)
+
     if technical:
         return {
             **result,
@@ -564,16 +602,28 @@ def format_adaptive_response(
             'status': status,
             'user_message': user_message,
             'next_step': next_step,
+            'diagnostics_file': str(diag_path),
         }
 
+    apk_ready = bool(result.get('apk_ready'))
     return {
         'mode': 'beginner',
         'status': status,
-        'user_message': user_message,
-        'next_step': next_step,
         'action': result.get('action'),
         'ecosystem': result.get('ecosystem') or result.get('inferred_ecosystem'),
-        'technical_details': result,
+        'user_message': user_message,
+        'next_step': next_step,
+        'code_implemented': bool(result.get('code_implemented')),
+        'code_modified': bool(result.get('code_modified')),
+        'tests_verified': bool(result.get('tests_verified')),
+        'persisted_files': list(result.get('persisted_files') or []),
+        'artifact_path': result.get('artifact_path'),
+        'apk_ready': apk_ready,
+        'apk_path': result.get('apk_path') if apk_ready else None,
+        'apk_options': result.get('apk_options') if apk_ready else None,
+        'limitations': result.get('user_limitations'),
+        'diagnostics_file': str(diag_path),
+        'agent_continuation': result.get('agent_continuation'),
     }
 
 

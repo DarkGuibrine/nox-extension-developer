@@ -41,7 +41,21 @@ def _emit(payload: dict[str, Any], *, as_json: bool = True, beginner: bool = Fal
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return
     status = payload.get('status') or payload.get('overall_status') or 'UNKNOWN'
-    if lang == 'pt-BR':
+    is_en = lang == 'en'
+    if payload.get('user_message'):
+        print(payload['user_message'])
+        if payload.get('limitations'):
+            for lim in payload['limitations']:
+                print(f'- {lim}')
+        if payload.get('apk_ready') and payload.get('apk_options'):
+            print()
+            for opt in payload['apk_options']:
+                print(opt['label'])
+        elif payload.get('next_step'):
+            print(payload['next_step'])
+        return
+
+    if not is_en:
         print(f'Status: {status}')
         if payload.get('guidance'):
             print(f"Próximo passo: {payload['guidance']}")
@@ -106,6 +120,8 @@ def build_parser() -> argparse.ArgumentParser:
         au.add_argument('--output', type=Path, help='optional destination folder for scaffolded files')
         au.add_argument('--repo', type=Path, help='optional repository root for duplicate/existing search')
         au.add_argument('--build-task', help='optional Gradle task to run inside Bubblewrap sandbox')
+        au.add_argument('--site-url', help='explicit website base URL override')
+        au.add_argument('--allow-local-fixture', action='store_true', help='allow loopback fixture servers (127.0.0.1/localhost)')
 
         ac = sub_action.add_parser('auto-create', help='beginner-first automated extension creation flow')
         ac.add_argument('prompt', nargs='+', help='plain-language description or target website URL')
@@ -115,6 +131,8 @@ def build_parser() -> argparse.ArgumentParser:
         ac.add_argument('--output', type=Path, help='optional destination folder for scaffolded files')
         ac.add_argument('--repo', type=Path, help='optional repository root')
         ac.add_argument('--build-task', help='optional Gradle task to run inside Bubblewrap sandbox')
+        ac.add_argument('--site-url', help='explicit website base URL override')
+        ac.add_argument('--allow-local-fixture', action='store_true', help='allow loopback fixture servers (127.0.0.1/localhost)')
 
         af = sub_action.add_parser('auto-fix', help='automated diagnosis, loop-detection, and adaptive repair guidance')
         af.add_argument('target', type=Path, help='local extension directory or source file')
@@ -122,6 +140,17 @@ def build_parser() -> argparse.ArgumentParser:
         af.add_argument('--ecosystem', choices=['keiyoushi', 'yuzono', 'lnreader'])
         af.add_argument('--build-task', help='optional Gradle task to compile in Bubblewrap sandbox')
         af.add_argument('--attempts-json', type=Path, help='optional JSON file listing previous troubleshooting attempts')
+        af.add_argument('--site-url', help='explicit website base URL override')
+        af.add_argument('--allow-local-fixture', action='store_true', help='allow loopback fixture servers (127.0.0.1/localhost)')
+
+        ad = sub_action.add_parser('apk-deliver', help='execute post-build APK delivery choice (1=save, 2=adb install/test, 3=keep)')
+        ad.add_argument('apk', type=Path, help='path to freshly compiled Debug APK')
+        ad.add_argument('--choice', required=True, help='1/save, 2/adb, or 3/keep')
+        ad.add_argument('--dest', type=Path, help='destination folder or APK file path when choice is save')
+        ad.add_argument('--overwrite', action='store_true', help='authorize overwriting an existing destination APK')
+        ad.add_argument('--serial', help='optional ADB device serial when multiple devices are connected')
+        ad.add_argument('--authorize-install', action='store_true', help='explicit user confirmation before adb install')
+        ad.add_argument('--expected-package', help='optional expected Android package name')
 
     _attach_global_flags_recursive(p, is_root=True)
     return p
@@ -558,8 +587,10 @@ def main(argv: list[str] | None = None) -> int:
                 ui_lang=lang,
                 build_task=args.build_task,
                 technical=technical,
+                site_url=args.site_url,
+                allow_local_fixture=bool(args.allow_local_fixture),
             )
-        elif parsed.get('intent') == 'fix' and not prompt_str.startswith('http'):
+        elif parsed.get('intent') == 'fix' and not args.site_url and not prompt_str.startswith('http'):
             res = {
                 **nox_core.format_adaptive_response(
                     {
@@ -593,6 +624,8 @@ def main(argv: list[str] | None = None) -> int:
                 build_task=args.build_task,
                 dry_run=bool(getattr(args, 'dry_run', False)),
                 technical=technical,
+                site_url=args.site_url,
+                allow_local_fixture=bool(args.allow_local_fixture),
             )
         _emit(res, as_json=args.json, beginner=args.beginner, lang=lang)
         return _exit_code_for_status(res['status'])
@@ -611,6 +644,8 @@ def main(argv: list[str] | None = None) -> int:
             build_task=args.build_task,
             dry_run=bool(getattr(args, 'dry_run', False)),
             technical=technical,
+            site_url=args.site_url,
+            allow_local_fixture=bool(args.allow_local_fixture),
         )
         _emit(res, as_json=args.json, beginner=args.beginner, lang=lang)
         return _exit_code_for_status(res['status'])
@@ -631,7 +666,26 @@ def main(argv: list[str] | None = None) -> int:
             attempts=attempts,
             build_task=args.build_task,
             technical=technical,
+            site_url=args.site_url,
+            allow_local_fixture=bool(args.allow_local_fixture),
         )
+        _emit(res, as_json=args.json, beginner=args.beginner, lang=lang)
+        return _exit_code_for_status(res['status'])
+
+    if cmd == 'apk-deliver':
+        lang = getattr(args, 'lang', 'pt-BR')
+        technical = bool(getattr(args, 'technical', False))
+        raw_res = nox_android.handle_apk_delivery_choice(
+            args.apk,
+            args.choice,
+            destination=args.dest,
+            overwrite=bool(args.overwrite),
+            serial=args.serial,
+            authorize_install=bool(args.authorize_install),
+            expected_package=args.expected_package,
+            lang=lang,
+        )
+        res = nox_core.format_adaptive_response(raw_res, technical=technical, lang=lang)
         _emit(res, as_json=args.json, beginner=args.beginner, lang=lang)
         return _exit_code_for_status(res['status'])
 
