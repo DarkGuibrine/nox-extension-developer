@@ -471,41 +471,41 @@ class SandboxAndBuildHardeningTests(unittest.TestCase):
     def test_sandbox_A_B_C_E_F_real_bubblewrap_isolation(self):
         with tempfile.TemporaryDirectory() as tmp:
             tp = Path(tmp)
-            host_secret = tp / 'host_secret.txt'
-            host_secret.write_text('TOP_SECRET_CREDENTIAL', encoding='utf-8')
+            canary_file = tp / 'host_canary.txt'
+            canary_file.write_text('NOX_ISOLATION_CANARY_DATA', encoding='utf-8')
             host_outside = tp / 'outside_protected.txt'
             host_outside.write_text('ORIGINAL_INTACT', encoding='utf-8')
 
-            # Test A: host $HOME / outside files / leaked host env secret unreadable inside sandbox
+            # Test A: host $HOME / outside files / host env variables unreadable inside sandbox
             proj_a = tp / 'proj_a'
             _make_valid_gradle_project(
                 proj_a,
                 gradlew_body=(
                     '#!/bin/sh\n'
                     'echo "HOME=$HOME"\n'
-                    'echo "SECRET=${NOX_CANARY_SECRET:-MISSING}"\n'
-                    f'if cat "{host_secret}" 2>/dev/null; then echo "LEAKED_SECRET"; else echo "HOST_SECRET_DENIED"; fi\n'
+                    'echo "CANARY_ENV=${NOX_CANARY_ENV_VAR:-MISSING}"\n'
+                    f'if cat "{canary_file}" 2>/dev/null; then echo "LEAKED_CANARY"; else echo "HOST_CANARY_DENIED"; fi\n'
                     f'if ls "{Path.home()}" 2>/dev/null; then echo "HOME_VISIBLE"; else echo "REAL_HOME_DENIED"; fi\n'
                     'exit 0\n'
                 ),
             )
-            old_secret = os.environ.get('NOX_CANARY_SECRET')
-            os.environ['NOX_CANARY_SECRET'] = 'ghp_TestCanarySecretTokenValue123456'
+            prev_env = os.environ.get('NOX_CANARY_ENV_VAR')
+            os.environ['NOX_CANARY_ENV_VAR'] = 'NOX_HOST_ENV_CANARY_987654'
             try:
                 res_a = nox_android.run_in_bwrap_sandbox(proj_a, ['./gradlew'])
             finally:
-                if old_secret is None:
-                    os.environ.pop('NOX_CANARY_SECRET', None)
+                if prev_env is None:
+                    os.environ.pop('NOX_CANARY_ENV_VAR', None)
                 else:
-                    os.environ['NOX_CANARY_SECRET'] = old_secret
+                    os.environ['NOX_CANARY_ENV_VAR'] = prev_env
 
             self.assertEqual(res_a['status'], 'PASS')
             self.assertIn('HOME=/work/.nox-sandbox-home', res_a['stdout'])
-            self.assertIn('SECRET=MISSING', res_a['stdout'])
-            self.assertIn('HOST_SECRET_DENIED', res_a['stdout'])
+            self.assertIn('CANARY_ENV=MISSING', res_a['stdout'])
+            self.assertIn('HOST_CANARY_DENIED', res_a['stdout'])
             self.assertIn('REAL_HOME_DENIED', res_a['stdout'])
-            self.assertNotIn('TOP_SECRET_CREDENTIAL', res_a['stdout'])
-            self.assertNotIn('ghp_TestCanarySecretTokenValue123456', res_a['stdout'])
+            self.assertNotIn('NOX_ISOLATION_CANARY_DATA', res_a['stdout'])
+            self.assertNotIn('NOX_HOST_ENV_CANARY_987654', res_a['stdout'])
 
             # Test B: write attempt outside project directory leaves host file untouched
             proj_b = tp / 'proj_b'
