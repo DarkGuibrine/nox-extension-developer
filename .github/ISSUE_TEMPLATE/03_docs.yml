@@ -45,4 +45,4 @@ body:
 
   - type: markdown
     attributes:
-      value: "🔒 Encontrou uma falha de segurança? Envie seu relato pelo [canal privado de segurança](https://github.com/ProjectNox-org/nox-extension-developer/security/advisories/new). (Found a security vulnerability? Submit your report through the [private security reporting channel](https://github.com/ProjectNox-org/nox-extension-developer/security/advisories/new).)"
+      value: "Encontrou uma falha de segurança? Relate pelo [canal privado de segurança do repositório](https://github.com/ProjectNox-org/nox-extension-developer/security/advisories/new). (Found a security vulnerability? Report it through the [repository's private security reporting channel](https://github.com/ProjectNox-org/nox-extension-developer/security/advisories/new).)"

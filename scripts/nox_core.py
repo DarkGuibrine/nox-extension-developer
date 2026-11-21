@@ -549,6 +549,7 @@ def build_agent_continuation(
     status: str,
     completed_gates: dict[str, str],
     next_agent_action: str,
+    execution_stages: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build deterministic continuation directive preventing agents from stopping at templates or diagnostics."""
     must_continue = (not task_complete) and (status.upper() != 'BLOCKED')
@@ -557,6 +558,7 @@ def build_agent_continuation(
         'must_continue_automatically': must_continue,
         'current_phase': phase,
         'completed_gates': completed_gates,
+        'execution_stages': execution_stages or completed_gates,
         'next_agent_action': next_agent_action,
         'do_not_ask_user': [
             'Do not ask permission to inspect site, consult docs/issues, scaffold, implement selectors, run tests, fix errors, or compile in sandbox.',
@@ -611,11 +613,14 @@ def format_adaptive_response(
         'status': status,
         'action': result.get('action'),
         'ecosystem': result.get('ecosystem') or result.get('inferred_ecosystem'),
+        'ui_lang': result.get('ui_lang') or lang,
+        'package_name': result.get('package_name'),
         'user_message': user_message,
         'next_step': next_step,
         'code_implemented': bool(result.get('code_implemented')),
         'code_modified': bool(result.get('code_modified')),
         'tests_verified': bool(result.get('tests_verified')),
+        'execution_stages': result.get('execution_stages'),
         'persisted_files': list(result.get('persisted_files') or []),
         'artifact_path': result.get('artifact_path'),
         'apk_ready': apk_ready,

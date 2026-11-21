@@ -1,1 +1,5 @@
 blank_issues_enabled: true
+contact_links:
+  - name: "🔒 Reportar falha de segurança / Report a security vulnerability"
+    url: https://github.com/ProjectNox-org/nox-extension-developer/security/advisories/new
+    about: "Envie vulnerabilidades em privado sem expor detalhes publicamente. (Submit vulnerabilities privately without disclosing details publicly.)"
