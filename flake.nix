@@ -309,7 +309,15 @@
               mkdir -p "$HOME" "$XDG_CACHE_HOME"
 
               python3 -c "import ast, pathlib; [ast.parse(p.read_bytes(), filename=str(p)) for d in ('scripts', 'tests') for p in pathlib.Path(d).glob('*.py')]"
-              python3 -m unittest discover -s tests -v
+              # `test_nox_scaffold` executa Node/Bubblewrap e exige um sandbox de
+              # usuário disponível; roda no CI do GitHub e em `nix develop`, não
+              # aqui (o build do Nix nega user namespaces aninhados).
+              for test_file in tests/test_*.py; do
+                case "$test_file" in
+                  tests/test_nox_scaffold.py) continue ;;
+                esac
+                python3 -m unittest "tests.$(basename "$test_file" .py)" -v
+              done
               python3 scripts/nox.py matrix --validate
               python3 scripts/nox.py scenarios
               python3 scripts/nox.py benchmark
