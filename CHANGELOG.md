@@ -11,9 +11,11 @@ Security hardening, automated beginner workflows, and Issue #10 CLI fix:
   - Added `probe_bwrap_sandbox` and `run_in_bwrap_sandbox` (`--unshare-all`, `--unshare-net` by default, `--die-with-parent`, `--new-session`, `--clearenv`, ephemeral staging copy excluding `.git`/symlinks/secrets, no `$HOME`/`~/.ssh`/`~/.agents` exposure).
   - Updated `build_debug_apk` and `nox.py bisect --test-cmd` to fail **closed** (`BLOCKED`, `executed_unprotected: false`) when Bubblewrap isolation is unavailable — zero host fallback.
   - Hardened `run_git_bisect_regression` with `-c core.hooksPath=/dev/null -c protocol.file.allow=never` and per-commit `audit_untrusted_pr_or_repo` gating.
-- **Automated beginner-first orchestration & loop prevention (`scripts/nox_core.py`, `scripts/nox_scaffold.py`, `scripts/nox.py`, `SKILL.md`):**
-  - Added `format_adaptive_response`, `detect_investigation_loop`, `build_optional_adb_guide`, `auto_create_extension`, `auto_fix_extension`, plus `nox.py auto`, `nox.py auto-create`, `nox.py auto-fix`, and `--technical`.
-  - Streamlined `SKILL.md` and bilingual guides so beginners do not need technical jargon or physical Android devices unless optional runtime debugging is explicitly needed.
+- **Automated beginner-first orchestration, real code execution, post-build APK delivery & loop prevention (`scripts/nox_core.py`, `scripts/nox_scaffold.py`, `scripts/nox_android.py`, `scripts/nox.py`, `SKILL.md`):**
+  - Added `build_agent_continuation`, updated `format_adaptive_response` (beginner mode stores technical details in `diagnostics_file` cleanly behind the scenes instead of dumping JSON/verifier payloads), and `detect_investigation_loop`.
+  - Upgraded `auto_create_extension` and `auto_fix_extension` to execute full end-to-end site probing, adapted selector/extractor code generation and automated source patching on disk, before/after verification, fail-closed Bubblewrap builds, and honest `INCONCLUSIVE`/`PASS` classification (never reporting `PASS` for unverified templates or recommendations alone).
+  - Added `verify_and_offer_apk_delivery`, `run_guided_adb_install_and_test`, `handle_apk_delivery_choice`, and `nox.py apk-deliver` delivering the 3 post-build options (`1. Salvar em outra pasta`, `2. Instalar e testar no meu celular`, `3. Deixar o APK onde está`) only after a freshly compiled Debug APK is confirmed, with non-destructive guided ADB steps.
+  - Updated `SKILL.md` and bilingual guides so agents never stop at intermediate tools and beginners never face unnecessary technical questions or raw logs.
 
 ## 2.0.0
 

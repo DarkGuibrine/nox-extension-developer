@@ -1,10 +1,21 @@
+from contextlib import redirect_stdout
+from http.server import ThreadingHTTPServer
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
-from pathlib import Path
+import threading
 import unittest
+import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 
+import nox
+import nox_android
 import nox_scaffold
 
 
@@ -36,6 +47,305 @@ class ScaffoldAndFunctionalScenariosTests(unittest.TestCase):
         self.assertEqual(res['scenario_b_repair']['after_statuses'], ['PASS', 'PASS', 'PASS'])
         self.assertEqual(res['scenario_c_update']['status'], 'PASS')
         self.assertTrue(res['scenario_c_update']['rename_blocked'])
+
+
+def _setup_sandbox_gradle_repo(repo_dir: Path, tp: Path, *, gradlew_body: str | None = None, fail_build: bool = False) -> bool:
+    """Create a valid Gradle Wrapper tree (and real debug-signed template APK when Android SDK tools are present)."""
+    gw_dir = repo_dir / 'gradle' / 'wrapper'
+    gw_dir.mkdir(parents=True, exist_ok=True)
+    (gw_dir / 'gradle-wrapper.properties').write_text(
+        'distributionBase=GRADLE_USER_HOME\n'
+        'distributionPath=wrapper/dists\n'
+        'distributionUrl=https\\://services.gradle.org/distributions/gradle-8.10.2-bin.zip\n'
+        'distributionSha256Sum=31c55713e40233a8303827ceb42ca48a47267a0ad4bab9177123121e71524c26\n',
+        encoding='utf-8',
+    )
+    with zipfile.ZipFile(gw_dir / 'gradle-wrapper.jar', 'w') as zf:
+        zf.writestr('META-INF/MANIFEST.MF', 'Manifest-Version: 1.0\nMain-Class: org.gradle.wrapper.GradleWrapperMain\n')
+        zf.writestr('org/gradle/wrapper/GradleWrapperMain.class', b'\xca\xfe\xba\xbe' + b'\x00' * 1200)
+    (repo_dir / 'settings.gradle.kts').write_text('rootProject.name = "demo"\n', encoding='utf-8')
+
+    tpl_apk = repo_dir / 'template.apk'
+    aapt2_bin = nox_android._find_android_tool('aapt2')
+    apksigner_bin = nox_android._find_android_tool('apksigner')
+    keytool_bin = shutil.which('keytool')
+    sdk_root = Path(os.environ.get('ANDROID_HOME', str(Path.home() / '.local/share/android-sdk')))
+    android_jars = sorted((sdk_root / 'platforms').glob('android-*/android.jar')) if (sdk_root / 'platforms').is_dir() else []
+
+    signed_real = False
+    if aapt2_bin and apksigner_bin and keytool_bin and android_jars:
+        manifest_xml = tp / 'AndroidManifest.xml'
+        manifest_xml.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<manifest xmlns:android="http://schemas.android.com/apk/res/android"\n'
+            '    package="eu.kanade.tachiyomi.extension.en.noxauto"\n'
+            '    android:versionCode="1"\n'
+            '    android:versionName="1.0">\n'
+            '    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="34" />\n'
+            '    <application android:label="NoxAuto" />\n'
+            '</manifest>\n',
+            encoding='utf-8',
+        )
+        subprocess.run([aapt2_bin, 'link', '--manifest', str(manifest_xml), '-I', str(android_jars[-1]), '-o', str(tpl_apk)], check=True, capture_output=True)
+        with zipfile.ZipFile(tpl_apk, 'a') as zf:
+            zf.writestr('classes.dex', b'dex\n035\x00')
+        ks = tp / 'dbg.keystore'
+        if not ks.exists():
+            subprocess.run(
+                [
+                    keytool_bin, '-genkeypair', '-noprompt',
+                    '-keystore', str(ks), '-storepass', 'android',
+                    '-alias', 'androiddebugkey', '-keypass', 'android',
+                    '-keyalg', 'RSA', '-keysize', '2048', '-validity', '1000',
+                    '-dname', 'CN=Android Debug,O=Android,C=US',
+                ],
+                check=True,
+                capture_output=True,
+            )
+        subprocess.run(
+            [
+                apksigner_bin, 'sign',
+                '--ks', str(ks), '--ks-pass', 'pass:android',
+                '--ks-key-alias', 'androiddebugkey', '--key-pass', 'pass:android',
+                '--v1-signing-enabled', 'true', '--v2-signing-enabled', 'true',
+                str(tpl_apk),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        signed_real = True
+    else:
+        with zipfile.ZipFile(tpl_apk, 'w') as zf:
+            zf.writestr('AndroidManifest.xml', b'manifest')
+            zf.writestr('classes.dex', b'dex\n035\x00')
+
+    body = gradlew_body or (
+        '#!/bin/sh\necho "Synthetic compile failure" >&2\nexit 1\n'
+        if fail_build
+        else '#!/bin/sh\nset -e\nmkdir -p app/build/outputs/apk/debug\ncp template.apk app/build/outputs/apk/debug/app-debug.apk\n'
+    )
+    gw = repo_dir / 'gradlew'
+    gw.write_text(body, encoding='utf-8')
+    gw.chmod(0o755)
+    return signed_real
+
+
+class FullAutomationEndToEndTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = ThreadingHTTPServer(('127.0.0.1', 0), nox_scaffold._FixtureHandler)
+        self.port = self.server.server_address[1]
+        self.base_url = f'http://127.0.0.1:{self.port}'
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+    def test_A_B_C_D_G_I_real_create_fix_across_three_ecosystems_and_beginner_ux(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tp = Path(tmp)
+
+            # TEST A: Real manga creation (Keiyoushi) adapts selectors & stays persisted
+            out_a = tp / 'manga_out'
+            res_a = nox_scaffold.auto_create_extension(
+                f'Crie uma extensao para este site: {self.base_url}',
+                allow_local_fixture=True,
+                output_dir=out_a,
+                ui_lang='pt-BR',
+            )
+            self.assertEqual(res_a['status'], 'PASS')
+            self.assertEqual(res_a['ecosystem'], 'keiyoushi')
+            self.assertTrue(res_a['code_implemented'])
+            self.assertTrue(res_a['tests_verified'])
+            self.assertEqual(res_a['mode'], 'beginner')
+            self.assertNotIn('technical_details', res_a)
+            self.assertTrue(Path(res_a['diagnostics_file']).is_file())
+            kt_a = Path(res_a['persisted_files'][1])
+            self.assertTrue(kt_a.is_file())
+            kt_a_text = kt_a.read_text(encoding='utf-8')
+            self.assertIn('data-src', kt_a_text)
+            self.assertIn('headersBuilder', kt_a_text)
+            self.assertIn('parseChapterNumber', kt_a_text)
+
+            # TEST B: Real manga repair reproduces FAIL -> edits .kt on disk -> verifies PASS
+            broken_manga = tp / 'broken_manga'
+            nox_scaffold.scaffold_extension(
+                'keiyoushi', 'BrokenManga', self.base_url, lang='pt-BR', output_dir=broken_manga, search_param='search', image_attr='src',
+            )
+            kt_b = next(broken_manga.rglob('*.kt'))
+            orig_b = kt_b.read_text(encoding='utf-8')
+            kt_b.write_text(
+                orig_b
+                .replace('a.chapter[href]', 'a.broken-chapter[href]')
+                .replace('img.absUrl("src").ifBlank { img.absUrl("data-lazy-src") }.ifBlank { img.absUrl("src") }', 'img.absUrl("src")')
+                .replace('    override fun headersBuilder() = super.headersBuilder().add("Referer", "$baseUrl/")\n\n', ''),
+                encoding='utf-8',
+            )
+            res_b = nox_scaffold.auto_fix_extension(
+                broken_manga,
+                'Os capitulos e imagens nao estao carregando',
+                allow_local_fixture=True,
+                technical=True,
+            )
+            self.assertEqual(res_b['before_verification']['status'], 'FAIL')
+            self.assertTrue(res_b['code_modified'])
+            self.assertGreaterEqual(len(res_b['modified_files']), 1)
+            self.assertEqual(res_b['after_verification']['status'], 'PASS')
+            self.assertEqual(res_b['identity_continuity']['status'], 'PASS')
+            self.assertEqual(res_b['status'], 'PASS')
+            fixed_b_text = kt_b.read_text(encoding='utf-8')
+            self.assertIn('a.chapter[href]', fixed_b_text)
+            self.assertIn('absUrl("data-src")', fixed_b_text)
+            self.assertIn('addQueryParameter("q"', fixed_b_text)
+
+            # TEST C: Yuzono anime creation & repair
+            out_c = tp / 'anime_out'
+            res_c = nox_scaffold.auto_create_extension(
+                f'Crie uma extensao de anime para {self.base_url}',
+                ecosystem='yuzono',
+                allow_local_fixture=True,
+                output_dir=out_c,
+            )
+            self.assertEqual(res_c['status'], 'PASS')
+            self.assertEqual(res_c['ecosystem'], 'yuzono')
+            self.assertTrue(res_c['code_implemented'])
+            self.assertTrue(res_c['tests_verified'])
+            kt_c = Path(res_c['persisted_files'][1])
+            kt_c.write_text(
+                kt_c.read_text(encoding='utf-8')
+                .replace('a.episode[href]', 'a.broken-episode[href]')
+                .replace('a.server[href]', 'a.broken-server[href]'),
+                encoding='utf-8',
+            )
+            fix_c = nox_scaffold.auto_fix_extension(out_c, 'episodios nao aparecem', ecosystem='yuzono', allow_local_fixture=True, technical=True)
+            self.assertEqual(fix_c['status'], 'PASS')
+            self.assertTrue(fix_c['code_modified'])
+            self.assertIn('a.episode[href]', kt_c.read_text(encoding='utf-8'))
+
+            # TEST D: LNReader novel creation & repair
+            out_d = tp / 'novel_out'
+            res_d = nox_scaffold.auto_create_extension(
+                f'Crie um plugin de novel para {self.base_url}',
+                ecosystem='lnreader',
+                allow_local_fixture=True,
+                output_dir=out_d,
+            )
+            self.assertEqual(res_d['status'], 'PASS')
+            self.assertEqual(res_d['ecosystem'], 'lnreader')
+            self.assertTrue(res_d['code_implemented'])
+            self.assertTrue(res_d['tests_verified'])
+            ts_d = Path(res_d['persisted_files'][0])
+            ts_d.write_text(
+                ts_d.read_text(encoding='utf-8')
+                .replace('.chapter-content', '.broken-content')
+                .replace("    $('script, style, nav').remove();\n", ''),
+                encoding='utf-8',
+            )
+            fix_d = nox_scaffold.auto_fix_extension(out_d, 'capitulo vazio', ecosystem='lnreader', allow_local_fixture=True, technical=True)
+            self.assertEqual(fix_d['status'], 'PASS')
+            self.assertTrue(fix_d['code_modified'])
+            fixed_d_text = ts_d.read_text(encoding='utf-8')
+            self.assertIn('.chapter-content', fixed_d_text)
+            self.assertIn("remove()", fixed_d_text)
+
+            # TEST G: Blocked/failed build preserves source code, never offers fake APK or install menu
+            blocked_repo = tp / 'blocked_gradle'
+            _setup_sandbox_gradle_repo(blocked_repo, tp)
+            res_g_blocked = nox_scaffold.auto_create_extension(
+                f'Crie uma extensao de manga para {self.base_url}',
+                repo_root=blocked_repo,
+                build_task=':app:assembleDebug',
+                allow_local_fixture=True,
+                sandbox_available_override=False,
+            )
+            self.assertEqual(res_g_blocked['status'], 'BLOCKED')
+            self.assertFalse(res_g_blocked['apk_ready'])
+            self.assertIsNone(res_g_blocked['apk_options'])
+            self.assertTrue(Path(res_g_blocked['persisted_files'][0]).is_file())
+
+            # TEST I: CLI --beginner output emits plain guidance without JSON/Gradle dumps
+            cli_out = tp / 'cli_beginner_out'
+            buf_beg = io.StringIO()
+            with redirect_stdout(buf_beg):
+                rc = nox.main([
+                    'auto-create',
+                    f'Crie uma extensao de manga para {self.base_url}',
+                    '--output', str(cli_out),
+                    '--allow-local-fixture',
+                    '--beginner',
+                ])
+            self.assertEqual(rc, 0)
+            spoken = buf_beg.getvalue()
+            self.assertNotIn('{', spoken)
+            self.assertNotIn('./gradlew', spoken)
+            self.assertNotIn('Traceback', spoken)
+
+    @unittest.skipUnless(nox_android.probe_bwrap_sandbox()['status'] == 'PASS', 'Bubblewrap sandbox unavailable on runner')
+    def test_E_F_real_sandboxed_apk_build_and_post_build_delivery_choices(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tp = Path(tmp)
+            repo = tp / 'android_repo'
+            signed_real = _setup_sandbox_gradle_repo(repo, tp)
+
+            res = nox_scaffold.auto_create_extension(
+                f'Crie uma extensao para este site: {self.base_url}',
+                name='ShadowReal',
+                repo_root=repo,
+                build_task=':app:assembleDebug',
+                allow_local_fixture=True,
+                ui_lang='pt-BR',
+            )
+            if signed_real:
+                self.assertEqual(res['status'], 'PASS')
+                self.assertTrue(res['apk_ready'])
+                self.assertEqual(len(res['apk_options']), 3)
+                apk_p = Path(res['apk_path'])
+                self.assertTrue(apk_p.is_file())
+                self.assertGreater(apk_p.stat().st_size, 0)
+
+                # Stale APK protection: reject an older min_mtime window
+                import time
+                stale = nox_android.verify_and_offer_apk_delivery(apk_p, min_mtime=time.time() + 120.0, lang='pt-BR')
+                self.assertFalse(stale['apk_ready'])
+                self.assertIsNone(stale['options'])
+
+                # Option 1: missing destination asks folder simply
+                ask_dest = nox_android.handle_apk_delivery_choice(apk_p, '1', lang='pt-BR')
+                self.assertEqual(ask_dest['status'], 'INCONCLUSIVE')
+                self.assertTrue(ask_dest['needs_destination'])
+
+                # Option 1: save copy preserves original & verifies SHA-256
+                dest_dir = tp / 'user_downloads'
+                saved = nox_android.handle_apk_delivery_choice(apk_p, '1', destination=dest_dir, lang='pt-BR')
+                self.assertEqual(saved['status'], 'PASS')
+                self.assertTrue(Path(saved['saved_path']).is_file())
+                self.assertTrue(apk_p.is_file())
+
+                # Option 1 without overwrite blocks replacing existing file
+                dup = nox_android.handle_apk_delivery_choice(apk_p, 'save', destination=dest_dir, overwrite=False, lang='pt-BR')
+                self.assertEqual(dup['status'], 'BLOCKED')
+                self.assertTrue(dup['requires_overwrite_authorization'])
+
+                # Option 3 via CLI keeps APK cleanly
+                buf_keep = io.StringIO()
+                with redirect_stdout(buf_keep):
+                    rc_keep = nox.main(['apk-deliver', str(apk_p), '--choice', '3', '--beginner'])
+                self.assertEqual(rc_keep, 0)
+                self.assertIn(str(apk_p.resolve()), buf_keep.getvalue())
+
+            # Simulated build error returns FAIL without fake APK
+            fail_repo = tp / 'fail_repo'
+            _setup_sandbox_gradle_repo(fail_repo, tp, fail_build=True)
+            res_fail = nox_scaffold.auto_create_extension(
+                f'Crie uma extensao para este site: {self.base_url}',
+                repo_root=fail_repo,
+                build_task=':app:assembleDebug',
+                allow_local_fixture=True,
+            )
+            self.assertEqual(res_fail['status'], 'FAIL')
+            self.assertFalse(res_fail['apk_ready'])
+            self.assertIsNone(res_fail['apk_options'])
 
 
 if __name__ == '__main__':

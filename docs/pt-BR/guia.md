@@ -161,16 +161,17 @@ python3 scripts/nox.py auto "<pedido-ou-url>" --json
 python3 scripts/nox.py auto-create "<pedido-ou-url>" --output <pasta>
 python3 scripts/nox.py auto-fix <alvo> --symptom "<erro>"
 python3 scripts/nox.py build <repo> <gradle-task>
+python3 scripts/nox.py apk-deliver <arquivo.apk> --choice <1|2|3>
 python3 scripts/nox.py benchmark
 python3 scripts/nox.py matrix --validate
 ```
 
-> Flags globais como `--json`, `--beginner`, `--technical`, `--dry-run` e `--lang` (exceto quando `--lang` define o idioma da extensão em `scaffold`) podem ser informadas **antes ou depois** dos subcomandos (ex.: `nox.py doctor --json` ou `nox.py --json doctor`).
+> Flags globais como `--json`, `--beginner`, `--technical`, `--dry-run` e `--lang` (exceto quando `--lang` define o idioma da extensão em `scaffold`) podem ser informadas **antes ou depois** dos subcomandos (ex.: `nox.py doctor --json` ou `nox.py --json doctor`). No modo iniciante (`--beginner` ou padrão dos fluxos `auto`), detalhes técnicos ficam salvos em arquivo interno (`diagnostics_file`) para manter a resposta curta e simples.
 
-### Guia rápido: Build isolado, APK Debug, USB/Wi-Fi ADB (opcional) e coleta de logs
+### Guia rápido: Build isolado, entrega do APK, USB/Wi-Fi ADB (opcional) e coleta de logs
 
 1. **Compilação Debug segura (`bwrap` fail-closed):** execute `python3 scripts/nox.py build <repo> <task>` (ex.: `:src:pt:exemplo:assembleDebug`). Antes de executar qualquer build Gradle, a CLI verifica wrapper/checksum SHA-256/`gradle-wrapper.jar` (`verify_gradle_execution_chain`) e isola a execução em cópia efêmera via Bubblewrap (`bwrap --unshare-all --clearenv`), sem acesso à rede, `$HOME` ou credenciais. Se `bwrap` estiver indisponível ou bloqueado no kernel, a etapa retorna `BLOCKED` sem executar nada no host.
-2. **Inspeção do APK:** execute `python3 scripts/nox.py apk-inspect <caminho.apk>` para conferir pacote, `versionCode`, SHA-256 e certificado (`Debug` vs `Release`). Um APK Debug não substitui uma instalação assinada com outra chave sem consentimento explícito; a skill **nunca** desinstala aplicativos automaticamente.
+2. **Inspeção e entrega do APK (após compilação concluída):** execute `python3 scripts/nox.py apk-inspect <caminho.apk>` ou deixe o fluxo automático confirmar pacote, `versionCode`, SHA-256 e assinatura (`Debug` vs `Release`). Somente depois de confirmar um APK Debug válido e atualizado, o fluxo oferece as três escolhas (`1. Salvar em outra pasta`, `2. Instalar e testar no meu celular`, `3. Deixar o APK onde está` via `nox.py apk-deliver`); a skill **nunca** desinstala aplicativos nem substitui instalações sem consentimento explícito.
 3. **Conexão ADB opcional (USB ou Wi-Fi):** não é necessária para criar fontes nem validar catálogo, busca, capítulos e imagens.
    - Se desejar testar ao vivo no aparelho: ative **Opções do desenvolvedor** e **Depuração USB** (ou **Depuração por Wi-Fi** no Android 11+, pareando via `adb pair <ip:porta>` — nunca compartilhe códigos de pareamento em logs).
    - Rode `python3 scripts/nox.py adb doctor`. Se houver 2+ dispositivos, informe `--serial <id>`. Se aparecer `unauthorized`, aceite a chave RSA na tela do aparelho.

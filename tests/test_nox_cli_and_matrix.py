@@ -159,20 +159,24 @@ class CliAndMatrixTests(unittest.TestCase):
         buf_beg = io.StringIO()
         with redirect_stdout(buf_beg):
             rc_beg = nox.main(['auto', 'Create manga extension for https://manga.example', '--dry-run'])
-        self.assertEqual(rc_beg, 0)
+        self.assertIn(rc_beg, {0, 2})
         beg_data = json.loads(buf_beg.getvalue())
         self.assertEqual(beg_data['mode'], 'beginner')
+        self.assertNotIn('technical_details', beg_data)
+        self.assertTrue(Path(beg_data['diagnostics_file']).is_file())
         self.assertIn('user_message', beg_data)
         self.assertIn('next_step', beg_data)
+        self.assertFalse(beg_data['agent_continuation']['task_complete'])
 
         buf_tech = io.StringIO()
         with redirect_stdout(buf_tech):
             rc_tech = nox.main(['auto', 'Create manga extension for https://manga.example', '--dry-run', '--technical'])
-        self.assertEqual(rc_tech, 0)
+        self.assertIn(rc_tech, {0, 2})
         tech_data = json.loads(buf_tech.getvalue())
         self.assertEqual(tech_data['mode'], 'technical')
         self.assertIn('parsed_request', tech_data)
         self.assertIn('reference_snapshot', tech_data)
+        self.assertEqual(tech_data['status'], 'INCONCLUSIVE')
 
         with tempfile.TemporaryDirectory() as tmp:
             tp = Path(tmp)
@@ -182,9 +186,13 @@ class CliAndMatrixTests(unittest.TestCase):
                 output_dir=out_dir,
                 ui_lang='pt-BR',
             )
-            self.assertEqual(created['status'], 'PASS')
+            # Unreachable .example site must remain INCONCLUSIVE rather than falsely claiming PASS for a bare template
+            self.assertEqual(created['status'], 'INCONCLUSIVE')
             self.assertEqual(created['ecosystem'], 'yuzono')
-            self.assertFalse(created['technical_details']['optional_adb_guide']['required'])
+            self.assertNotIn('technical_details', created)
+            self.assertTrue(created['agent_continuation']['must_continue_automatically'])
+            diag_loaded = json.loads(Path(created['diagnostics_file']).read_text(encoding='utf-8'))
+            self.assertFalse(diag_loaded['optional_adb_guide']['required'])
 
             att_file = tp / 'attempts.json'
             att_file.write_text(json.dumps([
@@ -194,11 +202,12 @@ class CliAndMatrixTests(unittest.TestCase):
             buf_fix = io.StringIO()
             with redirect_stdout(buf_fix):
                 rc_fix = nox.main(['auto-fix', str(out_dir), '--symptom', 'HTTP 403 Cloudflare', '--attempts-json', str(att_file), '--technical'])
-            self.assertEqual(rc_fix, 0)
+            self.assertIn(rc_fix, {0, 2})
             fix_data = json.loads(buf_fix.getvalue())
             self.assertTrue(fix_data['loop_detection']['loop_detected'])
             self.assertEqual(fix_data['loop_detection']['stagnation_category'], 'network_or_protection')
             self.assertFalse(fix_data['optional_adb_guide']['required'])
+            self.assertFalse(fix_data['code_modified'])
 
         loop_ok = nox_core.detect_investigation_loop([{'error': '404', 'selector': 'a', 'hypothesis': 'h1'}])
         self.assertFalse(loop_ok['loop_detected'])
