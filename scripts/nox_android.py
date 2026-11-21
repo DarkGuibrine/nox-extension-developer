@@ -141,27 +141,150 @@ def audit_untrusted_pr_or_repo(repo_path: Path | str) -> dict[str, Any]:
     }
 
 
-def _find_android_tool(name: str) -> str | None:
-    found = shutil.which(name)
-    if found:
-        return found
+def _detect_android_sdk_root() -> Path | None:
+    """Resolve Android SDK directory from environment variables or standard user-local install paths."""
     for env_key in ('ANDROID_HOME', 'ANDROID_SDK_ROOT'):
         sdk = os.environ.get(env_key)
         if sdk:
-            bt = Path(sdk) / 'build-tools'
-            if bt.is_dir():
-                versions = sorted(p for p in bt.iterdir() if p.is_dir())
-                for v in reversed(versions):
-                    cand = v / name
-                    if cand.is_file():
-                        return str(cand)
-    default_sdk = Path.home() / '.local/share/android-sdk/build-tools'
-    if default_sdk.is_dir():
-        for v in reversed(sorted(p for p in default_sdk.iterdir() if p.is_dir())):
-            cand = v / name
-            if cand.is_file():
-                return str(cand)
+            cand = Path(sdk).expanduser().resolve()
+            if cand.is_dir():
+                return cand
+    for rel in ('.local/share/android-sdk', 'Android/Sdk'):
+        cand = (Path.home() / rel).expanduser().resolve()
+        if cand.is_dir():
+            return cand
     return None
+
+
+def _find_android_tool(name: str, *, prefer_build_tools: bool = False) -> str | None:
+    sdk = _detect_android_sdk_root()
+    if prefer_build_tools and sdk is not None:
+        bt = sdk / 'build-tools'
+        if bt.is_dir():
+            for v in reversed(sorted(p for p in bt.iterdir() if p.is_dir())):
+                cand = v / name
+                if cand.is_file():
+                    return str(cand)
+    found = shutil.which(name)
+    if found:
+        return found
+    if sdk is not None:
+        bt = sdk / 'build-tools'
+        if bt.is_dir():
+            for v in reversed(sorted(p for p in bt.iterdir() if p.is_dir())):
+                cand = v / name
+                if cand.is_file():
+                    return str(cand)
+        pt = sdk / 'platform-tools' / name
+        if pt.is_file():
+            return str(pt)
+    return None
+
+
+def _pick_cached_gradle_jar(org_dir: Path, artifact: str, preferred_version: str | None = None) -> tuple[str | None, Path | None]:
+    """Select the newest (or matching preferred) jar for org_dir/artifact in local Gradle module cache."""
+    art_dir = org_dir / artifact
+    if not art_dir.is_dir():
+        return None, None
+    versions = sorted((p for p in art_dir.iterdir() if p.is_dir()), key=lambda p: [int(x) if x.isdigit() else x for x in re.split(r'[.-]', p.name)])
+    if preferred_version:
+        versions = [v for v in versions if v.name == preferred_version] + [v for v in reversed(versions) if v.name != preferred_version]
+    else:
+        versions = list(reversed(versions))
+    for ver_dir in versions:
+        jars = sorted(
+            j for j in ver_dir.rglob('*.jar')
+            if j.is_file() and not j.is_symlink() and not j.name.endswith(('-sources.jar', '-javadoc.jar'))
+        )
+        if jars:
+            return ver_dir.name, jars[0].resolve()
+    return None, None
+
+
+def _find_kotlin_compiler_jars() -> tuple[str | None, list[Path]]:
+    """Locate real Kotlin K2JVMCompiler and runtime jars on the host (Gradle cache or KOTLIN_HOME)."""
+    custom_dir = os.environ.get('NOX_KOTLIN_JARS_DIR') or (
+        str(Path(os.environ['KOTLIN_HOME']) / 'lib') if os.environ.get('KOTLIN_HOME') else None
+    )
+    if custom_dir:
+        cdir = Path(custom_dir).expanduser().resolve()
+        if cdir.is_dir():
+            jars = sorted(j.resolve() for j in cdir.glob('*.jar') if j.is_file() and not j.is_symlink())
+            if any('kotlin-compiler' in j.name for j in jars) and any('kotlin-stdlib' in j.name for j in jars):
+                return 'custom', jars
+
+    cache_root = Path.home() / '.gradle/caches/modules-2/files-2.1'
+    kt_org = cache_root / 'org.jetbrains.kotlin'
+    if not kt_org.is_dir():
+        return None, []
+    kt_ver, compiler_jar = _pick_cached_gradle_jar(kt_org, 'kotlin-compiler-embeddable')
+    if not kt_ver or not compiler_jar:
+        return None, []
+    found: list[Path] = [compiler_jar]
+    for art in ('kotlin-stdlib', 'kotlin-stdlib-jdk7', 'kotlin-stdlib-jdk8', 'kotlin-reflect', 'kotlin-script-runtime', 'kotlin-daemon-embeddable'):
+        _, jar = _pick_cached_gradle_jar(kt_org, art, preferred_version=kt_ver)
+        if jar is not None:
+            found.append(jar)
+    for org_name, art in (
+        ('org.jetbrains', 'annotations'),
+        ('org.jetbrains.kotlinx', 'kotlinx-coroutines-core-jvm'),
+        ('org.jetbrains.kotlinx', 'kotlinx-serialization-core-jvm'),
+        ('org.jetbrains.kotlinx', 'kotlinx-serialization-json-jvm'),
+        ('org.jetbrains.intellij.deps', 'trove4j'),
+    ):
+        _, jar = _pick_cached_gradle_jar(cache_root / org_name, art)
+        if jar is not None:
+            found.append(jar)
+    return kt_ver, found
+
+
+def find_kotlin_and_android_build_toolchain() -> dict[str, Any]:
+    """Detect real local Java, Kotlin K2JVMCompiler, D8, AAPT2, Keytool, Apksigner, android.jar, and bwrap tools."""
+    java_bin = shutil.which('java')
+    javac_bin = shutil.which('javac')
+    keytool_bin = shutil.which('keytool')
+    d8_bin = _find_android_tool('d8', prefer_build_tools=True)
+    aapt2_bin = _find_android_tool('aapt2', prefer_build_tools=True)
+    apksigner_bin = _find_android_tool('apksigner', prefer_build_tools=True)
+    sdk_root = _detect_android_sdk_root()
+
+    android_jar: Path | None = None
+    env_ajar = os.environ.get('NOX_ANDROID_JAR')
+    if env_ajar and Path(env_ajar).expanduser().is_file():
+        android_jar = Path(env_ajar).expanduser().resolve()
+    elif sdk_root is not None and (sdk_root / 'platforms').is_dir():
+        candidates = sorted((sdk_root / 'platforms').glob('android-*/android.jar'))
+        if candidates:
+            android_jar = candidates[-1].resolve()
+
+    kotlin_ver, kotlin_jars = _find_kotlin_compiler_jars()
+    bwrap = probe_bwrap_sandbox()
+
+    tools = {
+        'java': java_bin,
+        'javac': javac_bin,
+        'keytool': keytool_bin,
+        'd8': d8_bin,
+        'aapt2': aapt2_bin,
+        'apksigner': apksigner_bin,
+        'android_jar': str(android_jar) if android_jar else None,
+        'bwrap': bwrap.get('bwrap_path'),
+    }
+    missing = [k for k, v in tools.items() if not v]
+    if not kotlin_jars or not any('kotlin-compiler' in j.name for j in kotlin_jars):
+        missing.append('kotlin_compiler_jars')
+    if bwrap.get('status') != 'PASS':
+        missing.append('bwrap_sandbox')
+
+    return {
+        'status': 'PASS' if not missing else 'BLOCKED',
+        'tools': tools,
+        'android_sdk_root': str(sdk_root) if sdk_root else None,
+        'kotlin_version': kotlin_ver,
+        'kotlin_jars': [str(j) for j in kotlin_jars],
+        'bwrap': bwrap,
+        'missing': missing,
+    }
 
 
 def inspect_apk(
@@ -620,6 +743,7 @@ def build_bwrap_invocation(
     *,
     allow_network: bool = False,
     bwrap_bin: str | None = None,
+    extra_ro_binds: Sequence[tuple[str, str]] | None = None,
 ) -> list[str]:
     """Construct a fail-closed Bubblewrap invocation isolating namespaces, environment, and $HOME."""
     bwrap = bwrap_bin or shutil.which('bwrap') or 'bwrap'
@@ -683,6 +807,12 @@ def build_bwrap_invocation(
             cmd.extend(['--setenv', 'ANDROID_HOME', '/sandbox-sdk/android-sdk'])
             cmd.extend(['--setenv', 'ANDROID_SDK_ROOT', '/sandbox-sdk/android-sdk'])
             path_parts.append('/sandbox-sdk/android-sdk/platform-tools')
+
+    for host_src, guest_dst in extra_ro_binds or ():
+        hs = Path(host_src).expanduser().resolve()
+        gd_norm = Path(guest_dst).as_posix()
+        if hs.exists() and gd_norm.startswith('/sandbox-sdk/') and '..' not in Path(gd_norm).parts:
+            cmd.extend(['--ro-bind', str(hs), gd_norm])
 
     path_parts.extend(['/usr/local/sbin', '/usr/local/bin', '/usr/bin', '/bin'])
     cmd.extend([
@@ -832,6 +962,7 @@ def run_in_bwrap_sandbox(
     allow_network: bool = False,
     extract_outputs_to_host: bool = False,
     sandbox_available_override: bool | None = None,
+    extra_ro_binds: Sequence[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Execute command inside an ephemeral, network-isolated Bubblewrap copy; fail closed when unavailable."""
     if not command:
@@ -858,6 +989,7 @@ def run_in_bwrap_sandbox(
             command,
             allow_network=allow_network,
             bwrap_bin=probe.get('bwrap_path'),
+            extra_ro_binds=extra_ro_binds,
         )
         try:
             proc = subprocess.run(
@@ -995,10 +1127,707 @@ def build_debug_apk(
     }
 
 
+def verify_apk_contains_compiled_extension(
+    apk_path: Path | str,
+    *,
+    expected_package: str | None = None,
+    expected_class_name: str | None = None,
+    expected_methods: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Verify an APK contains valid DEX bytecode registering the compiled Kotlin class descriptor and methods."""
+    insp = inspect_apk(apk_path, expected_package=expected_package)
+    if insp.get('status') == 'FAIL' or not insp.get('has_dex'):
+        return {
+            'status': 'FAIL',
+            'apk_path': str(Path(apk_path).resolve()) if Path(apk_path).exists() else str(apk_path),
+            'apk_inspection': insp,
+            'has_dex': bool(insp.get('has_dex')),
+            'class_found_in_dex': False,
+            'methods_verified': [],
+            'missing_methods': list(expected_methods or ()),
+            'reason': 'apk_missing_valid_dex_or_manifest',
+        }
+
+    p = Path(apk_path)
+    dex_names: list[str] = []
+    dex_blobs: list[bytes] = []
+    valid_dex_headers = True
+    try:
+        with zipfile.ZipFile(p) as zf:
+            for name in sorted(zf.namelist()):
+                if name.endswith('.dex') and not name.startswith('/') and '..' not in Path(name).parts:
+                    blob = zf.read(name)
+                    dex_names.append(name)
+                    if not blob.startswith(b'dex\n') or len(blob) < 64:
+                        valid_dex_headers = False
+                    dex_blobs.append(blob)
+    except zipfile.BadZipFile as exc:
+        return {
+            'status': 'FAIL',
+            'apk_path': str(p),
+            'apk_inspection': insp,
+            'has_dex': False,
+            'class_found_in_dex': False,
+            'reason': f'corrupt_apk_zip:{exc}',
+        }
+
+    if not dex_blobs or not valid_dex_headers:
+        return {
+            'status': 'FAIL',
+            'apk_path': str(p.resolve()),
+            'apk_inspection': insp,
+            'has_dex': False,
+            'dex_files': dex_names,
+            'class_found_in_dex': False,
+            'reason': 'invalid_or_empty_dex_header',
+        }
+
+    combined_dex = b'\n'.join(dex_blobs)
+    expected_descriptor: str | None = None
+    class_found = True
+    if expected_package and expected_class_name:
+        pkg_slash = expected_package.strip('.').replace('.', '/')
+        expected_descriptor = f'L{pkg_slash}/{expected_class_name};'
+        class_found = expected_descriptor.encode('utf-8') in combined_dex
+    elif expected_package:
+        pkg_slash = expected_package.strip('.').replace('.', '/')
+        expected_descriptor = f'L{pkg_slash}/'
+        class_found = expected_descriptor.encode('utf-8') in combined_dex
+    elif expected_class_name:
+        expected_descriptor = f'/{expected_class_name};'
+        class_found = expected_descriptor.encode('utf-8') in combined_dex
+
+    verified_methods: list[str] = []
+    missing_methods: list[str] = []
+    for m_name in expected_methods or ():
+        if m_name.encode('utf-8') in combined_dex:
+            verified_methods.append(m_name)
+        else:
+            missing_methods.append(m_name)
+
+    issues = list(insp.get('issues') or [])
+    sig_ok = (insp.get('signing') or {}).get('verified') is True
+    ok = class_found and not missing_methods and sig_ok and not issues
+    reason = 'compiled_extension_verified_in_dex'
+    if not class_found:
+        reason = f'missing_expected_class_in_dex:{expected_descriptor}'
+    elif missing_methods:
+        reason = f"missing_expected_methods_in_dex:{','.join(missing_methods)}"
+    elif not sig_ok:
+        reason = 'apk_signature_not_verified'
+    elif issues:
+        reason = ','.join(issues)
+
+    return {
+        'status': 'PASS' if ok else 'FAIL',
+        'apk_path': str(p.resolve()),
+        'apk_sha256': insp.get('sha256'),
+        'has_dex': True,
+        'dex_files': dex_names,
+        'expected_descriptor': expected_descriptor,
+        'class_found_in_dex': class_found,
+        'methods_verified': verified_methods,
+        'missing_methods': missing_methods,
+        'apk_inspection': insp,
+        'reason': reason,
+    }
+
+
+_EXTENSION_COMPILE_STUBS: dict[str, str] = {
+    'StubRx.kt': """package rx
+
+open class Observable<T> {
+    companion object {
+        fun <T> just(value: T): Observable<T> = Observable()
+        fun <T> empty(): Observable<T> = Observable()
+    }
+}
+""",
+    'StubOkHttp.kt': """package okhttp3
+
+open class CacheControl {
+    companion object { val FORCE_NETWORK = CacheControl() }
+}
+
+open class Headers {
+    open class Builder {
+        open fun add(name: String, value: String): Builder = this
+        open fun set(name: String, value: String): Builder = this
+        open fun build(): Headers = Headers()
+    }
+    open fun newBuilder(): Builder = Builder()
+}
+
+open class HttpUrl(private val rawUrl: String = "") {
+    open val encodedPath: String get() = try { java.net.URI(rawUrl).rawPath ?: "" } catch (_: Throwable) { "" }
+    open val host: String get() = try { java.net.URI(rawUrl).host ?: "" } catch (_: Throwable) { "" }
+    open fun newBuilder(): Builder = Builder(rawUrl)
+    override fun toString(): String = rawUrl
+    open class Builder(private var base: String = "") {
+        open fun addPathSegment(segment: String): Builder = this
+        open fun addQueryParameter(name: String, value: String?): Builder = this
+        open fun setQueryParameter(name: String, value: String?): Builder = this
+        open fun build(): HttpUrl = HttpUrl(base)
+    }
+    companion object {
+        fun String.toHttpUrl(): HttpUrl = HttpUrl(this)
+        fun String.toHttpUrlOrNull(): HttpUrl? = if (isBlank()) null else HttpUrl(this)
+        fun get(url: String): HttpUrl = HttpUrl(url)
+    }
+}
+
+open class MediaType
+
+open class RequestBody {
+    companion object { fun create(content: String, mediaType: MediaType? = null): RequestBody = RequestBody() }
+}
+
+open class FormBody {
+    open class Builder {
+        open fun add(name: String, value: String): Builder = this
+        open fun build(): RequestBody = RequestBody()
+    }
+}
+
+open class Request(val url: HttpUrl = HttpUrl(), val headers: Headers = Headers()) {
+    open class Builder {
+        private var u: HttpUrl = HttpUrl()
+        private var h: Headers = Headers()
+        open fun url(url: String): Builder { u = HttpUrl(url); return this }
+        open fun url(url: HttpUrl): Builder { u = url; return this }
+        open fun headers(headers: Headers): Builder { h = headers; return this }
+        open fun post(body: RequestBody): Builder = this
+        open fun build(): Request = Request(u, h)
+    }
+}
+
+open class ResponseBody(private val content: String = "") {
+    open fun string(): String = content
+}
+
+open class Response(val code: Int = 200, val body: ResponseBody = ResponseBody(), val request: Request = Request()) {
+    open val isSuccessful: Boolean get() = code in 200..299
+}
+
+open class OkHttpClient {
+    open class Builder {
+        open fun addInterceptor(block: (Any) -> Response): Builder = this
+        open fun build(): OkHttpClient = OkHttpClient()
+    }
+}
+""",
+    'StubJsoupNodes.kt': """package org.jsoup.nodes
+
+open class Element(private val tagNameValue: String = "div", private val textValue: String = "") {
+    open fun select(cssQuery: String): Elements = Elements()
+    open fun selectFirst(cssQuery: String): Element? = null
+    open fun text(): String = textValue
+    open fun ownText(): String = textValue
+    open fun html(): String = ""
+    open fun attr(attributeKey: String): String = ""
+    open fun hasAttr(attributeKey: String): Boolean = false
+    open fun absUrl(attributeKey: String): String = ""
+    open fun hasText(): Boolean = textValue.isNotBlank()
+    open fun parent(): Element? = null
+}
+
+open class Elements(private val backing: List<Element> = emptyList()) : List<Element> by backing {
+    open fun attr(attributeKey: String): String = firstOrNull()?.attr(attributeKey).orEmpty()
+    open fun text(): String = joinToString(" ") { it.text() }
+    open fun first(): Element? = firstOrNull()
+    open fun select(cssQuery: String): Elements = this
+    open fun selectFirst(cssQuery: String): Element? = firstOrNull()
+}
+
+open class Document(val baseUri: String = "") : Element("document", "") {
+    open fun location(): String = baseUri
+}
+""",
+    'StubJsoup.kt': """package org.jsoup
+
+import org.jsoup.nodes.Document
+
+object Jsoup {
+    fun parse(html: String, baseUri: String = ""): Document = Document(baseUri)
+}
+""",
+    'StubKeiyoushiAnnotation.kt': """package keiyoushi.annotation
+
+@Target(AnnotationTarget.CLASS)
+annotation class Source
+""",
+    'StubKeiyoushiNetwork.kt': """package keiyoushi.network
+
+import okhttp3.OkHttpClient
+import okhttp3.Response
+
+enum class Fetch { DOCUMENT, JSON, TEXT }
+
+fun OkHttpClient.get(url: String, mode: Fetch = Fetch.DOCUMENT): Response = Response()
+fun OkHttpClient.post(url: String, body: Any? = null): Response = Response()
+""",
+    'StubKeiyoushiUtils.kt': """package keiyoushi.utils
+
+import okhttp3.Response
+import org.jsoup.nodes.Document
+
+fun Response.asJsoup(html: String? = null): Document = Document(request.url.toString())
+""",
+    'StubTachiyomiNetwork.kt': """package eu.kanade.tachiyomi.network
+
+import okhttp3.CacheControl
+import okhttp3.Headers
+import okhttp3.HttpUrl
+import okhttp3.Request
+import okhttp3.RequestBody
+
+fun GET(url: String, headers: Headers = Headers(), cache: CacheControl? = null): Request = Request(HttpUrl(url), headers)
+fun GET(url: HttpUrl, headers: Headers = Headers(), cache: CacheControl? = null): Request = Request(url, headers)
+fun POST(url: String, headers: Headers = Headers(), body: RequestBody = RequestBody()): Request = Request(HttpUrl(url), headers)
+""",
+    'StubTachiyomiUtil.kt': """package eu.kanade.tachiyomi.util
+
+import okhttp3.Response
+import org.jsoup.nodes.Document
+
+fun Response.asJsoup(html: String? = null): Document = Document(request.url.toString())
+""",
+    'StubSourceModel.kt': """package eu.kanade.tachiyomi.source.model
+
+open class FilterList(val list: List<Any> = emptyList())
+
+open class SManga {
+    open var url: String = ""
+    open var title: String = ""
+    open var artist: String? = null
+    open var author: String? = null
+    open var description: String? = null
+    open var genre: String? = null
+    open var status: Int = UNKNOWN
+    open var thumbnail_url: String? = null
+    open var initialized: Boolean = false
+    companion object {
+        const val UNKNOWN = 0
+        const val ONGOING = 1
+        const val COMPLETED = 2
+        const val LICENSED = 3
+        fun create(): SManga = SManga()
+    }
+}
+
+open class SChapter {
+    open var url: String = ""
+    open var name: String = ""
+    open var date_upload: Long = 0L
+    open var chapter_number: Float = -1f
+    open var scanlator: String? = null
+    companion object { fun create(): SChapter = SChapter() }
+}
+
+data class MangasPage(val mangas: List<SManga>, val hasNextPage: Boolean)
+data class SMangaUpdate(val manga: SManga, val chapters: List<SChapter>)
+data class Page(val index: Int, val url: String = "", var imageUrl: String? = null)
+""",
+    'StubSourceOnline.kt': """package eu.kanade.tachiyomi.source.online
+
+import eu.kanade.tachiyomi.source.model.*
+import okhttp3.Headers
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
+
+abstract class HttpSource {
+    open val id: Long = 0L
+    open val name: String = ""
+    open val baseUrl: String = ""
+    open val lang: String = ""
+    open val supportsLatest: Boolean = false
+    open val client: OkHttpClient = OkHttpClient()
+    open val headers: Headers = Headers()
+    open fun headersBuilder(): Headers.Builder = Headers.Builder()
+    open fun getFilterList(): FilterList = FilterList()
+    open fun popularMangaRequest(page: Int): Request = Request()
+    open fun popularMangaParse(response: Response): MangasPage = MangasPage(emptyList(), false)
+    open fun latestUpdatesRequest(page: Int): Request = Request()
+    open fun latestUpdatesParse(response: Response): MangasPage = MangasPage(emptyList(), false)
+    open fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = Request()
+    open fun searchMangaParse(response: Response): MangasPage = MangasPage(emptyList(), false)
+    open fun mangaDetailsParse(response: Response): SManga = SManga.create()
+    open fun chapterListParse(response: Response): List<SChapter> = emptyList()
+    open fun pageListParse(response: Response): List<Page> = emptyList()
+    open fun imageUrlParse(response: Response): String = ""
+}
+
+abstract class ParsedHttpSource : HttpSource() {
+    open fun popularMangaSelector(): String = ""
+    open fun popularMangaFromElement(element: Element): SManga = SManga.create()
+    open fun popularMangaNextPageSelector(): String? = null
+    open fun latestUpdatesSelector(): String = ""
+    open fun latestUpdatesFromElement(element: Element): SManga = SManga.create()
+    open fun latestUpdatesNextPageSelector(): String? = null
+    open fun searchMangaSelector(): String = ""
+    open fun searchMangaFromElement(element: Element): SManga = SManga.create()
+    open fun searchMangaNextPageSelector(): String? = null
+    open fun mangaDetailsParse(document: Document): SManga = SManga.create()
+    open fun chapterListSelector(): String = ""
+    open fun chapterFromElement(element: Element): SChapter = SChapter.create()
+    open fun pageListParse(document: Document): List<Page> = emptyList()
+    open fun imageUrlParse(document: Document): String = ""
+}
+""",
+    'StubKeiyoushiSource.kt': """package keiyoushi.source
+
+import eu.kanade.tachiyomi.source.model.*
+import okhttp3.Headers
+import okhttp3.HttpUrl
+import okhttp3.OkHttpClient
+
+abstract class KeiSource {
+    open val name: String = ""
+    open val baseUrl: String = ""
+    open val lang: String = ""
+    open val supportsLatest: Boolean = true
+    open val client: OkHttpClient = OkHttpClient()
+    open val headers: Headers = Headers()
+    open fun headersBuilder(): Headers.Builder = Headers.Builder()
+    open fun getFilterList(): FilterList = FilterList()
+    open suspend fun getPopularManga(page: Int): MangasPage = MangasPage(emptyList(), false)
+    open suspend fun getLatestUpdates(page: Int): MangasPage = MangasPage(emptyList(), false)
+    open suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage = MangasPage(emptyList(), false)
+    open suspend fun getMangaByUrl(url: HttpUrl): SManga? = null
+    open fun getMangaUrl(manga: SManga): String = ""
+    open suspend fun fetchMangaUpdate(manga: SManga, chapters: List<SChapter>, fetchDetails: Boolean, fetchChapters: Boolean): SMangaUpdate = SMangaUpdate(manga, chapters)
+    open fun getChapterUrl(chapter: SChapter): String = ""
+    open suspend fun getPageList(chapter: SChapter): List<Page> = emptyList()
+}
+""",
+    'StubAnimeModel.kt': """package eu.kanade.tachiyomi.animesource.model
+
+import okhttp3.Headers
+
+open class AnimeFilterList(val list: List<Any> = emptyList())
+
+open class SAnime {
+    open var url: String = ""
+    open var title: String = ""
+    open var artist: String? = null
+    open var author: String? = null
+    open var description: String? = null
+    open var genre: String? = null
+    open var status: Int = UNKNOWN
+    open var thumbnail_url: String? = null
+    open var initialized: Boolean = false
+    open fun setUrlWithoutDomain(rawUrl: String) { url = rawUrl }
+    companion object {
+        const val UNKNOWN = 0
+        const val ONGOING = 1
+        const val COMPLETED = 2
+        fun create(): SAnime = SAnime()
+    }
+}
+
+open class SEpisode {
+    open var url: String = ""
+    open var name: String = ""
+    open var date_upload: Long = 0L
+    open var episode_number: Float = -1f
+    open var scanlator: String? = null
+    open fun setUrlWithoutDomain(rawUrl: String) { url = rawUrl }
+    companion object { fun create(): SEpisode = SEpisode() }
+}
+
+data class AnimesPage(val animes: List<SAnime>, val hasNextPage: Boolean)
+data class Hoster(val hosterUrl: String = "", val hosterName: String = "", val internalData: String = "")
+data class Video(val url: String = "", val quality: String = "", val videoUrl: String? = null, val headers: Headers? = null, val videoTitle: String = "") {
+    constructor(videoUrl: String, videoTitle: String) : this(url = videoUrl, quality = videoTitle, videoUrl = videoUrl, headers = null, videoTitle = videoTitle)
+}
+""",
+    'StubAnimeOnline.kt': """package eu.kanade.tachiyomi.animesource.online
+
+import eu.kanade.tachiyomi.animesource.model.*
+import okhttp3.Headers
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
+
+abstract class AnimeHttpSource {
+    open val id: Long = 0L
+    open val name: String = ""
+    open val baseUrl: String = ""
+    open val lang: String = ""
+    open val supportsLatest: Boolean = false
+    open val client: OkHttpClient = OkHttpClient()
+    open val headers: Headers = Headers()
+    open fun headersBuilder(): Headers.Builder = Headers.Builder()
+    open fun getFilterList(): AnimeFilterList = AnimeFilterList()
+    open fun popularAnimeRequest(page: Int): Request = Request()
+    open fun popularAnimeParse(response: Response): AnimesPage = AnimesPage(emptyList(), false)
+    open fun latestUpdatesRequest(page: Int): Request = Request()
+    open fun latestUpdatesParse(response: Response): AnimesPage = AnimesPage(emptyList(), false)
+    open fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request = Request()
+    open fun searchAnimeParse(response: Response): AnimesPage = AnimesPage(emptyList(), false)
+    open fun animeDetailsParse(response: Response): SAnime = SAnime.create()
+    open fun episodeListParse(response: Response): List<SEpisode> = emptyList()
+    open fun seasonListParse(response: Response): List<SAnime> = emptyList()
+    open fun hosterListParse(response: Response): List<Hoster> = emptyList()
+    open fun videoListRequest(hoster: Hoster): Request = Request()
+    open fun videoListParse(response: Response, hoster: Hoster): List<Video> = emptyList()
+}
+
+abstract class ParsedAnimeHttpSource : AnimeHttpSource() {
+    open fun popularAnimeSelector(): String = ""
+    open fun popularAnimeFromElement(element: Element): SAnime = SAnime.create()
+    open fun popularAnimeNextPageSelector(): String? = null
+    open fun latestUpdatesSelector(): String = ""
+    open fun latestUpdatesFromElement(element: Element): SAnime = SAnime.create()
+    open fun latestUpdatesNextPageSelector(): String? = null
+    open fun searchAnimeSelector(): String = ""
+    open fun searchAnimeFromElement(element: Element): SAnime = SAnime.create()
+    open fun searchAnimeNextPageSelector(): String? = null
+    open fun animeDetailsParse(document: Document): SAnime = SAnime.create()
+    open fun episodeListSelector(): String = ""
+    open fun episodeFromElement(element: Element): SEpisode = SEpisode.create()
+}
+""",
+}
+
+
+def compile_kotlin_extension_to_debug_apk(
+    module_dir: Path | str,
+    *,
+    package_name: str,
+    class_name: str,
+    app_label: str = 'Nox Extension',
+    version_code: int = 1,
+    version_name: str = '1.0.1',
+    apk_filename: str | None = None,
+    expected_methods: Sequence[str] | None = None,
+    timeout: int = 180,
+    sandbox_available_override: bool | None = None,
+) -> dict[str, Any]:
+    """Compile real Kotlin extension sources to bytecode, DEX, binary resources, and signed Debug APK inside bwrap."""
+    mod_root = Path(module_dir).resolve()
+    if not mod_root.is_dir():
+        return {'status': 'FAIL', 'compiled': False, 'reason': f'module_dir_missing:{mod_root}', 'executed_unprotected': False}
+
+    if not re.fullmatch(r'[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+', package_name):
+        return {
+            'status': 'FAIL',
+            'compiled': False,
+            'reason': f'invalid_android_package_name:{package_name}',
+            'executed_unprotected': False,
+        }
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', class_name):
+        return {
+            'status': 'FAIL',
+            'compiled': False,
+            'reason': f'invalid_kotlin_class_name:{class_name}',
+            'executed_unprotected': False,
+        }
+
+    kt_files = sorted(
+        p.relative_to(mod_root).as_posix()
+        for p in mod_root.rglob('*.kt')
+        if p.is_file() and not p.is_symlink() and 'build/' not in p.relative_to(mod_root).as_posix()
+    )
+    if not kt_files:
+        return {'status': 'FAIL', 'compiled': False, 'reason': 'no_kotlin_sources_found', 'executed_unprotected': False}
+
+    sec = audit_untrusted_pr_or_repo(mod_root)
+    if sec['status'] == 'FAIL':
+        return {'status': 'FAIL', 'compiled': False, 'reason': 'security_preflight_failed', 'security': sec, 'executed_unprotected': False}
+
+    toolchain = find_kotlin_and_android_build_toolchain()
+    if toolchain['status'] != 'PASS':
+        return {
+            'status': 'BLOCKED',
+            'compiled': False,
+            'reason': f"missing_build_toolchain:{','.join(toolchain['missing'])}",
+            'toolchain': toolchain,
+            'executed_unprotected': False,
+        }
+
+    probe = probe_bwrap_sandbox(sandbox_available_override=sandbox_available_override)
+    if probe['status'] != 'PASS':
+        return {
+            'status': 'BLOCKED',
+            'compiled': False,
+            'reason': probe['reason'],
+            'sandbox': probe,
+            'toolchain': toolchain,
+            'executed_unprotected': False,
+        }
+
+    tools = toolchain['tools']
+    bt_dir = str(Path(tools['d8']).resolve().parent)
+    extra_binds: list[tuple[str, str]] = [
+        (bt_dir, '/sandbox-sdk/build-tools'),
+        (tools['android_jar'], '/sandbox-sdk/android.jar'),
+    ]
+    guest_kotlin_jars: list[str] = []
+    for jar_path in toolchain['kotlin_jars']:
+        jp = Path(jar_path).resolve()
+        guest_p = f'/sandbox-sdk/kotlin-jars/{jp.name}'
+        extra_binds.append((str(jp), guest_p))
+        guest_kotlin_jars.append(guest_p)
+
+    safe_apk_name = re.sub(r'[^A-Za-z0-9._-]', '-', apk_filename or f'{class_name.lower()}-debug.apk')
+    if not safe_apk_name.endswith('.apk'):
+        safe_apk_name += '.apk'
+
+    xml_escape = lambda s: (
+        str(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;').replace("'", '&apos;')
+    )
+    manifest_xml = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        f'<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="{xml_escape(package_name)}" '
+        f'android:versionCode="{int(version_code)}" android:versionName="{xml_escape(version_name)}">\n'
+        '    <uses-feature android:name="tachiyomi.extension" />\n'
+        f'    <application android:label="{xml_escape(app_label)}">\n'
+        f'        <meta-data android:name="tachiyomi.extension.class" android:value=".{xml_escape(class_name)}" />\n'
+        '    </application>\n'
+        '</manifest>\n'
+    )
+
+    build_payload = json.dumps({
+        'kt_files': kt_files,
+        'stubs': _EXTENSION_COMPILE_STUBS,
+        'manifest_xml': manifest_xml,
+        'kotlin_jars': guest_kotlin_jars,
+        'version_code': int(version_code),
+        'version_name': str(version_name),
+        'apk_name': safe_apk_name,
+    })
+
+    driver_code = (
+        'import json, pathlib, subprocess, sys, zipfile\n'
+        'cfg = json.loads(sys.argv[1])\n'
+        'b = pathlib.Path("/tmp/nox-ext-build")\n'
+        'sdir = b / "stubs"\n'
+        'sdir.mkdir(parents=True, exist_ok=True)\n'
+        'stub_files = []\n'
+        'for sname, stext in cfg["stubs"].items():\n'
+        '    sf = sdir / sname\n'
+        '    sf.write_text(stext, encoding="utf-8")\n'
+        '    stub_files.append(str(sf))\n'
+        '(b / "AndroidManifest.xml").write_text(cfg["manifest_xml"], encoding="utf-8")\n'
+        'cp = ":".join(cfg["kotlin_jars"])\n'
+        'comp_cp = cp + ":/sandbox-sdk/android.jar"\n'
+        'ext_jar = str(b / "ext.jar")\n'
+        'kt_srcs = [str(pathlib.Path("/work") / rel) for rel in cfg["kt_files"]] + stub_files\n'
+        'r1 = subprocess.run(["java", "-Xmx512m", "-cp", cp, "org.jetbrains.kotlin.cli.jvm.K2JVMCompiler", '
+        '"-classpath", comp_cp, "-jvm-target", "11", "-d", ext_jar, *kt_srcs], capture_output=True, text=True)\n'
+        'if r1.returncode != 0:\n'
+        '    print("STAGE:kotlinc_failed"); print(r1.stdout); print(r1.stderr); sys.exit(r1.returncode)\n'
+        '(b / "dex").mkdir(parents=True, exist_ok=True)\n'
+        'r2 = subprocess.run(["/sandbox-sdk/build-tools/d8", "--min-api", "21", "--lib", "/sandbox-sdk/android.jar", '
+        '"--output", str(b / "dex"), ext_jar], capture_output=True, text=True)\n'
+        'if r2.returncode != 0:\n'
+        '    print("STAGE:d8_failed"); print(r2.stdout); print(r2.stderr); sys.exit(r2.returncode)\n'
+        'r3 = subprocess.run(["/sandbox-sdk/build-tools/aapt2", "link", "--manifest", str(b / "AndroidManifest.xml"), '
+        '"-I", "/sandbox-sdk/android.jar", "-o", str(b / "unsigned.apk"), "--min-sdk-version", "21", '
+        '"--target-sdk-version", "34", "--version-code", str(cfg["version_code"]), "--version-name", cfg["version_name"]], capture_output=True, text=True)\n'
+        'if r3.returncode != 0:\n'
+        '    print("STAGE:aapt2_failed"); print(r3.stdout); print(r3.stderr); sys.exit(r3.returncode)\n'
+        'with zipfile.ZipFile(b / "unsigned.apk", "a") as zf:\n'
+        '    for df in sorted((b / "dex").glob("*.dex")):\n'
+        '        zf.write(df, df.name)\n'
+        'ks = str(b / "debug.keystore")\n'
+        'r4 = subprocess.run(["keytool", "-genkeypair", "-noprompt", "-keystore", ks, "-alias", "androiddebugkey", '
+        '"-keyalg", "RSA", "-keysize", "2048", "-validity", "10000", "-storepass", "android", "-keypass", "android", '
+        '"-dname", "CN=Android Debug,O=Android,C=US"], capture_output=True, text=True)\n'
+        'if r4.returncode != 0:\n'
+        '    print("STAGE:keytool_failed"); print(r4.stdout); print(r4.stderr); sys.exit(r4.returncode)\n'
+        'out_dir = pathlib.Path("/work/build/outputs/apk/debug")\n'
+        'out_dir.mkdir(parents=True, exist_ok=True)\n'
+        'out_apk = out_dir / cfg["apk_name"]\n'
+        'r5 = subprocess.run(["/sandbox-sdk/build-tools/apksigner", "sign", "--ks", ks, "--ks-pass", "pass:android", '
+        '"--key-pass", "pass:android", "--ks-key-alias", "androiddebugkey", "--out", str(out_apk), str(b / "unsigned.apk")], capture_output=True, text=True)\n'
+        'if r5.returncode != 0:\n'
+        '    print("STAGE:apksigner_failed"); print(r5.stdout); print(r5.stderr); sys.exit(r5.returncode)\n'
+        'print("STAGE:compiled_and_signed:" + cfg["apk_name"])\n'
+    )
+
+    import time
+    build_started_at = time.time()
+    sandbox_res = run_in_bwrap_sandbox(
+        mod_root,
+        ['/usr/bin/python3', '-c', driver_code, build_payload],
+        timeout=timeout,
+        allow_network=False,
+        extract_outputs_to_host=True,
+        sandbox_available_override=sandbox_available_override,
+        extra_ro_binds=extra_binds,
+    )
+    if sandbox_res['status'] == 'BLOCKED' or sandbox_res.get('returncode') is None:
+        return {
+            'status': sandbox_res['status'],
+            'compiled': False,
+            'reason': sandbox_res['reason'],
+            'sandbox': sandbox_res.get('sandbox'),
+            'toolchain': toolchain,
+            'executed_unprotected': False,
+            'apk_inspection': None,
+        }
+
+    log_out = sanitize_text((sandbox_res.get('stdout') or '') + '\n' + (sandbox_res.get('stderr') or ''), redact_home=True)
+    if sandbox_res['returncode'] != 0:
+        return {
+            'status': 'FAIL',
+            'compiled': False,
+            'reason': 'kotlin_or_android_compilation_failed',
+            'command': sandbox_res.get('sandbox_command', []),
+            'sandbox': sandbox_res.get('sandbox'),
+            'toolchain': toolchain,
+            'executed_unprotected': False,
+            'log_tail': log_out.splitlines()[-35:],
+        }
+
+    collected = [Path(p) for p in (sandbox_res.get('collected_apks') or [])]
+    apk_path = next((p for p in collected if p.name == safe_apk_name), None)
+    if apk_path is None or not apk_path.is_file():
+        return {
+            'status': 'FAIL',
+            'compiled': False,
+            'reason': 'apk_artifact_missing_after_sandbox_compile',
+            'sandbox': sandbox_res.get('sandbox'),
+            'executed_unprotected': False,
+            'log_tail': log_out.splitlines()[-25:],
+        }
+
+    dex_ver = verify_apk_contains_compiled_extension(
+        apk_path,
+        expected_package=package_name,
+        expected_class_name=class_name,
+        expected_methods=expected_methods,
+    )
+    return {
+        'status': dex_ver['status'],
+        'compiled': dex_ver['status'] == 'PASS',
+        'reason': dex_ver['reason'],
+        'apk_path': str(apk_path.resolve()),
+        'apk_sha256': dex_ver.get('apk_sha256'),
+        'build_started_at': build_started_at,
+        'apk_inspection': dex_ver.get('apk_inspection'),
+        'dex_verification': dex_ver,
+        'command': sandbox_res.get('sandbox_command', []),
+        'sandbox': sandbox_res.get('sandbox'),
+        'toolchain': toolchain,
+        'executed_unprotected': False,
+        'log_tail': log_out.splitlines()[-25:],
+    }
+
+
 def verify_and_offer_apk_delivery(
     apk_path: Path | str | None,
     *,
     expected_package: str | None = None,
+    expected_class_name: str | None = None,
+    expected_methods: Sequence[str] | None = None,
     min_mtime: float | None = None,
     lang: str = 'pt-BR',
 ) -> dict[str, Any]:
@@ -1012,7 +1841,7 @@ def verify_and_offer_apk_delivery(
             'user_message': (
                 'No Debug APK was produced yet, so phone installation options are unavailable.'
                 if is_en
-                else 'Nenhum APK Debug foi gerado nesta etapa; as opcoes de entrega nao estao disponiveis.'
+                else 'Nenhum APK Debug foi gerado nesta etapa; as opções de entrega não estão disponíveis.'
             ),
             'options': None,
         }
@@ -1026,7 +1855,7 @@ def verify_and_offer_apk_delivery(
             'user_message': (
                 'The APK artifact is missing or empty.'
                 if is_en
-                else 'O arquivo APK nao existe ou esta vazio.'
+                else 'O arquivo APK não existe ou está vazio.'
             ),
             'options': None,
         }
@@ -1039,45 +1868,70 @@ def verify_and_offer_apk_delivery(
             'user_message': (
                 'Rejected an older APK file because it was not produced by the latest build.'
                 if is_en
-                else 'Descartei um arquivo APK antigo porque ele nao foi gerado pela compilacao mais recente.'
+                else 'Descartei um arquivo APK antigo porque ele não foi gerado pela compilação mais recente.'
             ),
             'options': None,
         }
 
-    insp = inspect_apk(p, expected_package=expected_package)
-    issues = insp.get('issues') or []
-    sig_failed = 'apk_signature_verification_failed' in issues or 'package_mismatch' in issues
-    if insp.get('status') == 'FAIL' or not insp.get('has_dex') or sig_failed:
-        return {
-            'status': 'FAIL',
-            'apk_ready': False,
-            'reason': 'apk_inspection_failed',
-            'apk_inspection': insp,
-            'user_message': (
-                'The compiled APK failed integrity or package verification.'
-                if is_en
-                else 'O APK gerado falhou na verificacao de integridade ou pacote.'
-            ),
-            'options': None,
-        }
+    if expected_class_name or expected_methods:
+        dex_ver = verify_apk_contains_compiled_extension(
+            p,
+            expected_package=expected_package,
+            expected_class_name=expected_class_name,
+            expected_methods=expected_methods,
+        )
+        insp = dex_ver.get('apk_inspection') or {}
+        if dex_ver.get('status') != 'PASS':
+            return {
+                'status': 'FAIL',
+                'apk_ready': False,
+                'reason': dex_ver.get('reason') or 'apk_dex_verification_failed',
+                'apk_inspection': insp,
+                'dex_verification': dex_ver,
+                'user_message': (
+                    'The APK exists, but it does not contain the compiled extension class or failed verification.'
+                    if is_en
+                    else 'O APK foi encontrado, mas não contém a extensão compilada esperada ou falhou na verificação.'
+                ),
+                'options': None,
+            }
+    else:
+        dex_ver = None
+        insp = inspect_apk(p, expected_package=expected_package)
+        issues = insp.get('issues') or []
+        sig_failed = 'apk_signature_verification_failed' in issues or 'package_mismatch' in issues
+        if insp.get('status') == 'FAIL' or not insp.get('has_dex') or sig_failed:
+            return {
+                'status': 'FAIL',
+                'apk_ready': False,
+                'reason': 'apk_inspection_failed',
+                'apk_inspection': insp,
+                'user_message': (
+                    'The compiled APK failed integrity or package verification.'
+                    if is_en
+                    else 'O APK gerado falhou na verificação de integridade ou pacote.'
+                ),
+                'options': None,
+            }
 
     options = (
         [
-            {'id': 1, 'key': 'save', 'label': '1. Save to another folder'},
-            {'id': 2, 'key': 'adb', 'label': '2. Install and test on my phone'},
-            {'id': 3, 'key': 'keep', 'label': '3. Leave the APK where it is'},
+            {'id': 1, 'key': 'save', 'label': '1. Save to another folder.'},
+            {'id': 2, 'key': 'adb', 'label': '2. Install and test on your phone.'},
+            {'id': 3, 'key': 'keep', 'label': '3. Keep the APK where it is.'},
         ]
         if is_en
         else [
-            {'id': 1, 'key': 'save', 'label': '1. Salvar em outra pasta'},
-            {'id': 2, 'key': 'adb', 'label': '2. Instalar e testar no meu celular'},
-            {'id': 3, 'key': 'keep', 'label': '3. Deixar o APK onde está'},
+            {'id': 1, 'key': 'save', 'label': '1. Salvar em outra pasta.'},
+            {'id': 2, 'key': 'adb', 'label': '2. Instalar e testar no celular.'},
+            {'id': 3, 'key': 'keep', 'label': '3. Manter o APK onde está.'},
         ]
     )
-    prompt = (
-        'What do you want to do with the APK?'
+    prompt = 'What would you like to do?' if is_en else 'O que você deseja fazer?'
+    header = (
+        'All set! Your extension has been created and the Debug APK is ready. 💜'
         if is_en
-        else 'O que você quer fazer com o APK?'
+        else 'Pronto! Sua extensão foi criada e o APK Debug está disponível. 💜'
     )
     return {
         'status': 'PASS',
@@ -1086,8 +1940,113 @@ def verify_and_offer_apk_delivery(
         'apk_sha256': insp.get('sha256'),
         'apk_package': (insp.get('metadata') or {}).get('package'),
         'apk_inspection': insp,
+        'dex_verification': dex_ver,
+        'user_header': header,
         'prompt': prompt,
         'options': options,
+    }
+
+
+_DEFAULT_HOST_APPS: tuple[str, ...] = (
+    'app.mihon',
+    'eu.kanade.tachiyomi',
+    'xyz.jmir.tachiyomi.mi',
+    'xyz.jmir.tachiyomi.sy',
+    'xyz.jmir.tachiyomi.az',
+    'app.aniyomi',
+    'xyz.jmir.tachiyomi.mi.debug',
+    'app.mihon.debug',
+    'org.lnreader.app',
+)
+
+_ANDROID_UI_RUNTIME_ERROR_RE = re.compile(
+    r"(?i)(?:cloudflare|http\s*403|http\s*404|http\s*50[023]|timed?\s*out|nullpointerexception|"
+    r"nenhum\s+cap[íi]tulo|no\s+chapters|no\s+results|nenhum\s+resultado|"
+    r"isn't\s+responding|application\s+not\s+responding|falha\s+ao\s+carregar|error\s+loading)"
+)
+
+
+def _evaluate_android_ui_functional_dump(
+    xml_text: str | None,
+    *,
+    host_package: str | None = None,
+    source_name: str | None = None,
+) -> dict[str, Any]:
+    """Safely inspect UIAutomator XML output for extension presence, catalog/chapters/media readiness, and UI errors."""
+    stripped = (xml_text or '').strip()
+    if not stripped or not stripped.startswith('<') or '<!DOCTYPE' in stripped.upper() or '<!ENTITY' in stripped.upper():
+        return {
+            'xml_valid': False,
+            'extension_loaded': False,
+            'search_or_catalog_verified': False,
+            'chapters_or_episodes_verified': False,
+            'media_verified': False,
+            'ui_errors': [],
+            'nodes_count': 0,
+        }
+
+    parsed = parse_uiautomator_hierarchy_and_plan_actions(
+        stripped,
+        target_queries=('search', 'explore', 'browse', 'extensions', 'sources', 'catalog', 'chapter', 'episode', 'page', 'video'),
+    )
+    if parsed.get('reason', '').startswith('invalid_'):
+        return {
+            'xml_valid': False,
+            'extension_loaded': False,
+            'search_or_catalog_verified': False,
+            'chapters_or_episodes_verified': False,
+            'media_verified': False,
+            'ui_errors': [],
+            'nodes_count': 0,
+        }
+
+    root = ET.fromstring(stripped)
+    node_packages: set[str] = set()
+    labels: list[str] = []
+    ui_errors: list[str] = [b['label'] for b in (parsed.get('error_banners') or []) if b.get('label')]
+    for el in root.iter('node'):
+        pkg_attr = (el.attrib.get('package') or '').strip()
+        if pkg_attr:
+            node_packages.add(pkg_attr)
+        txt = (el.attrib.get('text') or '').strip()
+        desc = (el.attrib.get('content-desc') or '').strip()
+        rid = (el.attrib.get('resource-id') or '').strip()
+        msg = f'{txt} {desc}'.strip()
+        if msg:
+            labels.append(msg)
+            if _ANDROID_UI_RUNTIME_ERROR_RE.search(msg) and msg not in ui_errors:
+                ui_errors.append(msg)
+        if rid:
+            labels.append(rid)
+
+    in_launcher_only = bool(node_packages) and host_package and (host_package not in node_packages) and all(
+        'launcher' in np or 'systemui' in np for np in node_packages
+    )
+    joined = ' | '.join(labels).lower()
+    src_low = (source_name or '').strip().lower()
+    ext_loaded = (not in_launcher_only) and (
+        (bool(src_low) and src_low in joined)
+        or any(k in joined for k in ('extens', 'sources', 'fontes', 'browse', 'explorar', 'loaded'))
+    )
+    catalog_ok = (not in_launcher_only) and (not ui_errors) and any(
+        k in joined for k in ('popular', 'latest', 'recent', 'search', 'busca', 'pesquis', 'catalog', 'catálogo', 'manga', 'novel', 'anime', 'result')
+    )
+    chapters_ok = (not in_launcher_only) and (not ui_errors) and any(
+        k in joined for k in ('capítulo', 'capitulo', 'chapter', 'episódio', 'episodio', 'episode')
+    )
+    media_ok = (not in_launcher_only) and (not ui_errors) and any(
+        k in joined for k in ('página', 'pagina', 'page', 'image', 'player', 'video', 'stream')
+    )
+    return {
+        'xml_valid': True,
+        'in_launcher_only': in_launcher_only,
+        'extension_loaded': ext_loaded,
+        'search_or_catalog_verified': catalog_ok,
+        'chapters_or_episodes_verified': chapters_ok,
+        'media_verified': media_ok,
+        'ui_errors': ui_errors,
+        'nodes_count': parsed.get('nodes_count', 0),
+        'node_packages': sorted(node_packages),
     }
 
 
@@ -1097,11 +2056,15 @@ def run_guided_adb_install_and_test(
     serial: str | None = None,
     authorize_install: bool = False,
     expected_package: str | None = None,
+    source_name: str | None = None,
+    host_app_packages: Sequence[str] | None = None,
     lang: str = 'pt-BR',
     runner: Callable[[list[str]], tuple[int, str, str]] | None = None,
     logcat_sample: str | None = None,
+    ui_dump_sample: str | None = None,
+    auto_fix_callback: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Guide optional ADB device setup, require explicit install authorization, install non-destructively, and verify runtime logs."""
+    """Guide optional ADB setup, require install consent, install safely, verify host app + UI hierarchy + logcat, and stay strictly honest."""
     is_en = lang == 'en'
     apk_p = Path(apk_path)
     if apk_p.is_symlink() or not apk_p.is_file() or apk_p.stat().st_size <= 0:
@@ -1110,6 +2073,7 @@ def run_guided_adb_install_and_test(
             'step': 'invalid_apk',
             'installed': False,
             'real_device_homologated': False,
+            'physical_device_homologated': False,
             'user_message': 'APK file is missing or invalid.' if is_en else 'O arquivo APK não existe ou é inválido.',
         }
 
@@ -1124,6 +2088,7 @@ def run_guided_adb_install_and_test(
             'requires_tool_install_authorization': True,
             'simulated_adb': False,
             'real_device_homologated': False,
+            'physical_device_homologated': False,
             'user_message': (
                 'Android connection tool (ADB) is not installed on this computer. Can I guide or install it to test on your phone?'
                 if is_en
@@ -1152,6 +2117,7 @@ def run_guided_adb_install_and_test(
             'installed': False,
             'simulated_adb': simulated_adb,
             'real_device_homologated': False,
+            'physical_device_homologated': False,
             'user_message': (
                 f'Could not talk to Android devices ({exc}).'
                 if is_en
@@ -1167,6 +2133,7 @@ def run_guided_adb_install_and_test(
             'installed': False,
             'simulated_adb': simulated_adb,
             'real_device_homologated': False,
+            'physical_device_homologated': False,
             'user_message': sanitize_text(err_dev or 'ADB failed to list devices.', redact_home=True),
         }
 
@@ -1201,6 +2168,7 @@ def run_guided_adb_install_and_test(
             'installed': False,
             'simulated_adb': simulated_adb,
             'real_device_homologated': False,
+            'physical_device_homologated': False,
             'user_message': (
                 'Turn on USB Debugging on your phone, connect the USB cable, accept the popup, and tell me when it is connected.'
                 if is_en
@@ -1218,6 +2186,7 @@ def run_guided_adb_install_and_test(
             'installed': False,
             'simulated_adb': simulated_adb,
             'real_device_homologated': False,
+            'physical_device_homologated': False,
             'user_message': (
                 'I found your phone, but you need to tap Allow on the phone screen to authorize this computer.'
                 if is_en
@@ -1239,6 +2208,7 @@ def run_guided_adb_install_and_test(
             'installed': False,
             'simulated_adb': simulated_adb,
             'real_device_homologated': False,
+            'physical_device_homologated': False,
             'user_message': (
                 'The phone appeared as offline. Reconnect the USB cable or unlock the screen and try again.'
                 if is_en
@@ -1255,6 +2225,7 @@ def run_guided_adb_install_and_test(
             'installed': False,
             'simulated_adb': simulated_adb,
             'real_device_homologated': False,
+            'physical_device_homologated': False,
             'user_message': (
                 f"More than one phone or emulator is connected ({', '.join(d['serial'] for d in ready)}). Tell me which one to use."
                 if is_en
@@ -1272,6 +2243,7 @@ def run_guided_adb_install_and_test(
             'installed': False,
             'simulated_adb': simulated_adb,
             'real_device_homologated': False,
+            'physical_device_homologated': False,
             'user_message': (
                 f'Selected device {serial} is not ready.'
                 if is_en
@@ -1293,6 +2265,7 @@ def run_guided_adb_install_and_test(
             'installed': False,
             'simulated_adb': simulated_adb,
             'real_device_homologated': False,
+            'physical_device_homologated': False,
             'user_message': (
                 f"Phone ready ({target_dev['serial']}). Can I install the extension APK{f' ({pkg})' if pkg else ''} on this device now?"
                 if is_en
@@ -1314,6 +2287,7 @@ def run_guided_adb_install_and_test(
             'signature_conflict': sig_conflict,
             'simulated_adb': simulated_adb,
             'real_device_homologated': False,
+            'physical_device_homologated': False,
             'install_output': sanitize_text(combined_inst, redact_home=True),
             'user_message': (
                 'Could not install this Debug APK because another version with a different signature or newer version is already installed. Nothing was uninstalled automatically.'
@@ -1330,10 +2304,59 @@ def run_guided_adb_install_and_test(
             ),
         }
 
-    pkg_verified = True
+    android_gates: dict[str, Any] = {
+        'apk_installed': True,
+        'package_detected': False,
+        'host_app_opened': False,
+        'extension_loaded': False,
+        'search_or_catalog_verified': False,
+        'chapters_or_episodes_verified': False,
+        'media_verified': False,
+        'simulated_only': simulated_adb,
+        'physical_device_homologated': False,
+    }
+
+    pkg_verified = False
     if pkg:
         rc_pm, out_pm, _ = _exec_adb(['-s', target_dev['serial'], 'shell', 'pm', 'path', pkg], timeout=15)
-        pkg_verified = rc_pm == 0 and ('package:' in out_pm or not out_pm.strip())
+        pkg_verified = rc_pm == 0 and 'package:' in out_pm
+        if not pkg_verified:
+            rc_pl, out_pl, _ = _exec_adb(['-s', target_dev['serial'], 'shell', 'pm', 'list', 'packages', pkg], timeout=15)
+            pkg_verified = rc_pl == 0 and f'package:{pkg}' in out_pl
+    android_gates['package_detected'] = pkg_verified
+
+    host_candidates = tuple(host_app_packages) if host_app_packages else _DEFAULT_HOST_APPS
+    rc_pkgs, out_pkgs, _ = _exec_adb(['-s', target_dev['serial'], 'shell', 'pm', 'list', 'packages'], timeout=15)
+    installed_pkgs = {
+        line.split('package:', 1)[1].strip()
+        for line in out_pkgs.splitlines()
+        if line.strip().startswith('package:')
+    } if rc_pkgs == 0 else set()
+    host_pkg = next((cand for cand in host_candidates if cand in installed_pkgs), None)
+    if host_pkg:
+        rc_launch, _, _ = _exec_adb(
+            ['-s', target_dev['serial'], 'shell', 'monkey', '-p', host_pkg, '-c', 'android.intent.category.LAUNCHER', '1'],
+            timeout=15,
+        )
+        android_gates['host_app_opened'] = rc_launch == 0
+
+    raw_ui_xml = ui_dump_sample
+    if raw_ui_xml is None and android_gates['host_app_opened']:
+        rc_dump, _, _ = _exec_adb(['-s', target_dev['serial'], 'shell', 'uiautomator', 'dump', '/sdcard/nox_uidump.xml'], timeout=15)
+        if rc_dump == 0:
+            rc_cat, out_xml, _ = _exec_adb(['-s', target_dev['serial'], 'shell', 'cat', '/sdcard/nox_uidump.xml'], timeout=15)
+            if rc_cat == 0 and '<hierarchy' in out_xml:
+                raw_ui_xml = out_xml
+
+    ui_eval = _evaluate_android_ui_functional_dump(
+        raw_ui_xml,
+        host_package=host_pkg,
+        source_name=source_name,
+    )
+    android_gates['extension_loaded'] = ui_eval['extension_loaded']
+    android_gates['search_or_catalog_verified'] = ui_eval['search_or_catalog_verified']
+    android_gates['chapters_or_episodes_verified'] = ui_eval['chapters_or_episodes_verified']
+    android_gates['media_verified'] = ui_eval['media_verified']
 
     raw_logcat = logcat_sample
     if raw_logcat is None:
@@ -1341,41 +2364,87 @@ def run_guided_adb_install_and_test(
         raw_logcat = out_log
 
     filtered = parse_and_filter_logcat(raw_logcat or '', target_package=pkg)
-    if filtered['target_crashes']:
-        return {
+    if filtered['target_crashes'] or ui_eval['ui_errors']:
+        repair_res = None
+        fail_payload = {
             'status': 'FAIL',
-            'step': 'post_install_crash_detected',
+            'step': 'post_install_crash_detected' if filtered['target_crashes'] else 'post_install_ui_error_detected',
             'adb_present': True,
             'selected_device': target_dev,
             'target_package': pkg,
+            'host_package': host_pkg,
             'installed': True,
             'package_verified': pkg_verified,
             'needs_auto_fix_continuation': True,
+            'android_gates': android_gates,
+            'ui_inspection': ui_eval,
             'filtered_logcat': filtered,
             'simulated_adb': simulated_adb,
             'real_device_homologated': False,
+            'physical_device_homologated': False,
+        }
+        if auto_fix_callback is not None:
+            repair_res = auto_fix_callback(fail_payload)
+            fail_payload['auto_fix_result'] = repair_res
+        fail_payload['user_message'] = (
+            'Installed the extension on your phone, detected a runtime or screen error while opening it, and started diagnosing the fix.'
+            if is_en
+            else 'Instalei a extensão no celular, identifiquei um erro ao testá-la na tela e já iniciei a correção automática.'
+        )
+        return fail_payload
+
+    functional_verified = (
+        android_gates['apk_installed']
+        and android_gates['host_app_opened']
+        and ui_eval['xml_valid']
+        and (android_gates['extension_loaded'] or android_gates['search_or_catalog_verified'])
+        and android_gates['search_or_catalog_verified']
+    )
+
+    if not functional_verified:
+        return {
+            'status': 'INCONCLUSIVE',
+            'step': 'installed_pending_ui_verification',
+            'adb_present': True,
+            'selected_device': target_dev,
+            'target_package': pkg,
+            'host_package': host_pkg,
+            'installed': True,
+            'package_verified': pkg_verified,
+            'android_gates': android_gates,
+            'ui_inspection': ui_eval,
+            'filtered_logcat': filtered,
+            'simulated_adb': simulated_adb,
+            'real_device_homologated': False,
+            'physical_device_homologated': False,
             'user_message': (
-                'Installed the extension, detected an error when opening it on the phone, and I am investigating the cause to fix it.'
+                'The extension APK is installed on your phone, and I found no crashes in recent logs, but I could not verify catalog or chapter loading inside the reader app yet.'
                 if is_en
-                else 'Instalei a extensão no celular, identifiquei um erro ao executá-la e já vou analisar a causa para corrigir.'
+                else 'O APK foi instalado no celular e não mostrou falhas nos logs recentes, mas ainda não consegui comprovar o carregamento do catálogo e dos capítulos dentro do aplicativo leitor.'
             ),
         }
 
+    physical_ok = not simulated_adb
+    android_gates['physical_device_homologated'] = physical_ok
     return {
         'status': 'PASS',
-        'step': 'installed_and_checked',
+        'step': 'installed_and_verified_in_app',
         'adb_present': True,
         'selected_device': target_dev,
         'target_package': pkg,
+        'host_package': host_pkg,
         'installed': True,
         'package_verified': pkg_verified,
+        'android_gates': android_gates,
+        'ui_inspection': ui_eval,
         'filtered_logcat': filtered,
         'simulated_adb': simulated_adb,
-        'real_device_homologated': not simulated_adb,
+        'real_device_homologated': physical_ok,
+        'physical_device_homologated': physical_ok,
         'user_message': (
-            'Extension installed on your phone without runtime errors. Open the app and test catalog, chapters, and pages!'
+            'Extension installed and verified inside the reader app on your device without errors!'
             if is_en
-            else 'Extensão instalada no celular sem erros nos registros recentes. Agora abra o aplicativo para testar catálogo, capítulos e carregamento!'
+            else 'Extensão instalada e testada dentro do aplicativo no celular sem erros!'
         ),
     }
 
@@ -1588,8 +2657,11 @@ def parse_uiautomator_hierarchy_and_plan_actions(
     target_queries: Sequence[str] = ('search', 'explore', 'browse'),
 ) -> dict[str, Any]:
     """Parse Android uiautomator dump XML hierarchy, extract bounds/tap centers, error banners, and planned ADB input commands (0052/0601)."""
+    stripped = (xml_text or '').strip()
+    if not stripped or '<!DOCTYPE' in stripped.upper() or '<!ENTITY' in stripped.upper():
+        return {'status': 'FAIL', 'reason': 'invalid_or_unsafe_uiautomator_xml', 'nodes_count': 0}
     try:
-        root = ET.fromstring(xml_text.strip())
+        root = ET.fromstring(stripped)
     except ET.ParseError as exc:
         return {'status': 'FAIL', 'reason': f'invalid_uiautomator_xml:{exc}', 'nodes_count': 0}
 

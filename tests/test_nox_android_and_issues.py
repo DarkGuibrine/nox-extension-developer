@@ -694,41 +694,172 @@ class SandboxAndBuildHardeningTests(unittest.TestCase):
             self.assertTrue(st_fail['signature_conflict'])
             self.assertFalse(any('uninstall' in ' '.join(c) for c in seen_cmds))
 
-            # 7a. Install succeeds + clean logcat -> PASS with simulated_adb=True, real_device_homologated=False
-            def _ok_runner(args: list[str]) -> tuple[int, str, str]:
+            # 7a. Install succeeds + clean logcat WITHOUT UI verification -> INCONCLUSIVE (never PASS from install alone!)
+            def _install_only_runner(args: list[str]) -> tuple[int, str, str]:
                 if 'devices' in args:
                     return 0, 'List of devices attached\nemulator-5554 device\n', ''
                 if 'install' in args:
                     return 0, 'Success', ''
-                if 'pm' in args:
+                if 'pm' in args and 'path' in args:
                     return 0, 'package:/data/app/demo.apk', ''
+                if 'pm' in args and 'packages' in args:
+                    return 0, 'package:eu.kanade.tachiyomi.extension.pt.demo\n', ''
+                return 0, '11-21 10:00:00.000  1000  1001 I NoxExt: Loaded cleanly\n', ''
+
+            st_install_only = nox_android.run_guided_adb_install_and_test(
+                apk, authorize_install=True, expected_package='eu.kanade.tachiyomi.extension.pt.demo', runner=_install_only_runner,
+            )
+            self.assertEqual(st_install_only['status'], 'INCONCLUSIVE')
+            self.assertEqual(st_install_only['step'], 'installed_pending_ui_verification')
+            self.assertTrue(st_install_only['installed'])
+            self.assertTrue(st_install_only['android_gates']['apk_installed'])
+            self.assertTrue(st_install_only['android_gates']['package_detected'])
+            self.assertFalse(st_install_only['android_gates']['search_or_catalog_verified'])
+            self.assertFalse(st_install_only['real_device_homologated'])
+            self.assertFalse(st_install_only['physical_device_homologated'])
+
+            # 7b. Full ADB host launch + UIAutomator catalog/chapters/page verification -> PASS (simulated_adb=True, physical_device_homologated=False)
+            healthy_ui_xml = (
+                '<hierarchy rotation="0">'
+                '<node index="0" package="app.mihon" text="Browse Extensions - DemoScan" resource-id="app.mihon:id/title" bounds="[0,0][500,80]"/>'
+                '<node index="1" package="app.mihon" text="Search Catalog Manga" resource-id="app.mihon:id/search" bounds="[0,90][500,180]"/>'
+                '<node index="2" package="app.mihon" text="Chapter 1" resource-id="app.mihon:id/chapter" bounds="[0,190][500,260]"/>'
+                '<node index="3" package="app.mihon" text="Page 1" resource-id="app.mihon:id/page_view" bounds="[0,270][500,400]"/>'
+                '</hierarchy>'
+            )
+
+            def _full_ui_runner(args: list[str]) -> tuple[int, str, str]:
+                if 'devices' in args:
+                    return 0, 'List of devices attached\nemulator-5554 device\n', ''
+                if 'install' in args:
+                    return 0, 'Success', ''
+                if 'pm' in args and 'path' in args:
+                    return 0, 'package:/data/app/demo.apk', ''
+                if 'pm' in args and 'packages' in args:
+                    return 0, 'package:app.mihon\npackage:eu.kanade.tachiyomi.extension.pt.demo\n', ''
+                if 'monkey' in args:
+                    return 0, 'Events injected: 1', ''
+                if 'uiautomator' in args:
+                    return 0, 'UI hierchary dumped to: /sdcard/nox_uidump.xml', ''
+                if 'cat' in args and '/sdcard/nox_uidump.xml' in args:
+                    return 0, healthy_ui_xml, ''
                 return 0, '11-21 10:00:00.000  1000  1001 I NoxExt: Loaded cleanly\n', ''
 
             st_ok = nox_android.run_guided_adb_install_and_test(
-                apk, authorize_install=True, expected_package='eu.kanade.tachiyomi.extension.pt.demo', runner=_ok_runner,
+                apk, authorize_install=True, expected_package='eu.kanade.tachiyomi.extension.pt.demo',
+                source_name='DemoScan', runner=_full_ui_runner,
             )
             self.assertEqual(st_ok['status'], 'PASS')
             self.assertTrue(st_ok['installed'])
+            self.assertTrue(st_ok['android_gates']['host_app_opened'])
+            self.assertTrue(st_ok['android_gates']['extension_loaded'])
+            self.assertTrue(st_ok['android_gates']['search_or_catalog_verified'])
+            self.assertTrue(st_ok['android_gates']['chapters_or_episodes_verified'])
+            self.assertTrue(st_ok['android_gates']['media_verified'])
             self.assertTrue(st_ok['simulated_adb'])
             self.assertFalse(st_ok['real_device_homologated'])
+            self.assertFalse(st_ok['physical_device_homologated'])
 
-            # 7b. Post-install crash detected in target package -> feeds back into repair
+            # 7c. Post-install crash detected in target package or UI error triggers repair loop
             crash_log = (
                 '11-21 10:00:01.000  2222  2222 E AndroidRuntime: FATAL EXCEPTION: main\n'
                 '11-21 10:00:01.001  2222  2222 E AndroidRuntime: Process: eu.kanade.tachiyomi.extension.pt.demo, PID: 2222\n'
                 '11-21 10:00:01.002  2222  2222 E AndroidRuntime: java.lang.NullPointerException: selector missing\n'
             )
+            repaired_calls: list[str] = []
             st_crash = nox_android.run_guided_adb_install_and_test(
                 apk,
                 authorize_install=True,
                 expected_package='eu.kanade.tachiyomi.extension.pt.demo',
-                runner=_ok_runner,
+                runner=_full_ui_runner,
                 logcat_sample=crash_log,
+                auto_fix_callback=lambda info: repaired_calls.append(info['step']) or {'status': 'PASS'},
             )
             self.assertEqual(st_crash['status'], 'FAIL')
             self.assertEqual(st_crash['step'], 'post_install_crash_detected')
             self.assertTrue(st_crash['needs_auto_fix_continuation'])
+            self.assertEqual(repaired_calls, ['post_install_crash_detected'])
             self.assertFalse(st_crash['real_device_homologated'])
+
+            # 7d. UI error banner (e.g. Cloudflare / HTTP 403 / No chapters) triggers repair even with clean logcat
+            err_ui = '<hierarchy><node package="app.mihon" text="HTTP 403 Cloudflare protection active" bounds="[0,0][500,100]"/></hierarchy>'
+            st_ui_err = nox_android.run_guided_adb_install_and_test(
+                apk,
+                authorize_install=True,
+                expected_package='eu.kanade.tachiyomi.extension.pt.demo',
+                runner=_full_ui_runner,
+                ui_dump_sample=err_ui,
+            )
+            self.assertEqual(st_ui_err['status'], 'FAIL')
+            self.assertEqual(st_ui_err['step'], 'post_install_ui_error_detected')
+            self.assertTrue(st_ui_err['needs_auto_fix_continuation'])
+
+    def test_06_negative_dex_class_and_dummy_apk_rejection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dummy = Path(tmp) / 'dummy.apk'
+            with zipfile.ZipFile(dummy, 'w') as zf:
+                zf.writestr('AndroidManifest.xml', b'manifest')
+                zf.writestr('classes.dex', b'dex\n035\x00' + b'\x00' * 120)
+            res = nox_android.verify_apk_contains_compiled_extension(
+                dummy,
+                expected_package='eu.kanade.tachiyomi.extension.pt.demo',
+                expected_class_name='DemoSource',
+                expected_methods=['getPopularManga', 'getSearchMangaList'],
+            )
+            self.assertEqual(res['status'], 'FAIL')
+            self.assertFalse(res['class_found_in_dex'])
+            self.assertTrue(
+                res['reason'].startswith('missing_expected_class_in_dex')
+                or res['reason'] == 'apk_missing_valid_dex_or_manifest'
+            )
+
+            # When SDK+bwrap exist, compile real APK and confirm wrong class descriptor in DEX fails
+            if nox_android.find_kotlin_and_android_build_toolchain()['status'] == 'PASS':
+                mod = Path(tmp) / 'mod'
+                kt_dir = mod / 'src/eu/kanade/tachiyomi/extension/pt/realcls'
+                kt_dir.mkdir(parents=True)
+                (kt_dir / 'RealCls.kt').write_text(
+                    'package eu.kanade.tachiyomi.extension.pt.realcls\nclass RealCls { fun okMethod(): String = "ok" }\n',
+                    encoding='utf-8',
+                )
+                compiled = nox_android.compile_kotlin_extension_to_debug_apk(
+                    mod,
+                    package_name='eu.kanade.tachiyomi.extension.pt.realcls',
+                    class_name='RealCls',
+                    expected_methods=['okMethod'],
+                )
+                self.assertEqual(compiled['status'], 'PASS')
+                wrong = nox_android.verify_apk_contains_compiled_extension(
+                    compiled['apk_path'],
+                    expected_package='eu.kanade.tachiyomi.extension.pt.realcls',
+                    expected_class_name='WrongClassName',
+                )
+                self.assertEqual(wrong['status'], 'FAIL')
+                self.assertFalse(wrong['class_found_in_dex'])
+                self.assertIn('missing_expected_class_in_dex', wrong['reason'])
+
+    def test_10_issue_templates_yaml_title_prefixes_and_security_links(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        tpl_dir = repo_root / '.github' / 'ISSUE_TEMPLATE'
+        expected_prefixes = {
+            '01_bug.yml': '[Bug] ',
+            '02_compatibility.yml': '[Compatibilidade] ',
+            '03_docs.yml': '[Documentação] ',
+            '04_feature.yml': '[Funcionalidade] ',
+            '05_improvement.yml': '[Melhoria] ',
+        }
+        sec_url = 'https://github.com/ProjectNox-org/nox-extension-developer/security/advisories/new'
+        for fname, prefix in expected_prefixes.items():
+            p = tpl_dir / fname
+            self.assertTrue(p.is_file(), f'Missing issue form: {fname}')
+            txt = p.read_text(encoding='utf-8')
+            self.assertIn(f'title: "{prefix}"', txt, f'{fname} missing default title prefix {prefix!r}')
+            self.assertIn(sec_url, txt, f'{fname} missing private security advisory link')
+            self.assertNotIn('\t', txt, f'{fname} must not contain tabs in YAML')
+        cfg_txt = (tpl_dir / 'config.yml').read_text(encoding='utf-8')
+        self.assertIn('blank_issues_enabled:', cfg_txt)
+        self.assertIn('contact_links:', cfg_txt)
+        self.assertIn(sec_url, cfg_txt)
 
     def test_J_full_automation_blocks_malicious_repos(self):
         import nox_scaffold

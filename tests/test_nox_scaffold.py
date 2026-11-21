@@ -16,7 +16,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 
 import nox
 import nox_android
+import nox_env
 import nox_scaffold
+
+
+_HAS_ANDROID_COMPILE_SANDBOX = (
+    nox_android.find_kotlin_and_android_build_toolchain()['status'] == 'PASS'
+    and nox_android.probe_bwrap_sandbox()['status'] == 'PASS'
+)
 
 
 class ScaffoldAndFunctionalScenariosTests(unittest.TestCase):
@@ -146,7 +153,7 @@ class FullAutomationEndToEndTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tp = Path(tmp)
 
-            # TEST A: Real manga creation (Keiyoushi) adapts selectors & stays persisted
+            # TEST A: Real manga creation (Keiyoushi) adapts selectors, executes behavior, & compiles APK when SDK+bwrap present
             out_a = tp / 'manga_out'
             res_a = nox_scaffold.auto_create_extension(
                 f'Crie uma extensao para este site: {self.base_url}',
@@ -154,16 +161,27 @@ class FullAutomationEndToEndTests(unittest.TestCase):
                 output_dir=out_a,
                 ui_lang='pt-BR',
             )
-            self.assertEqual(res_a['status'], 'PASS')
             self.assertEqual(res_a['ecosystem'], 'keiyoushi')
             self.assertTrue(res_a['code_implemented'])
             self.assertTrue(res_a['tests_verified'])
+            self.assertEqual(res_a['execution_stages']['extension_functions_tested'], 'PASS')
+            if _HAS_ANDROID_COMPILE_SANDBOX:
+                self.assertEqual(res_a['status'], 'PASS')
+                self.assertTrue(res_a['apk_ready'])
+                self.assertEqual(res_a['execution_stages']['code_compiled'], 'PASS')
+                self.assertEqual(res_a['execution_stages']['apk_inspected'], 'PASS')
+            else:
+                self.assertEqual(res_a['status'], 'BLOCKED')
+                self.assertFalse(res_a['apk_ready'])
+                self.assertEqual(res_a['execution_stages']['apk_generated'], 'BLOCKED')
             self.assertEqual(res_a['mode'], 'beginner')
             self.assertNotIn('technical_details', res_a)
             self.assertTrue(Path(res_a['diagnostics_file']).is_file())
             kt_a = Path(res_a['persisted_files'][1])
             self.assertTrue(kt_a.is_file())
+            self.assertNotIn('/pt-BR/', kt_a.as_posix())
             kt_a_text = kt_a.read_text(encoding='utf-8')
+            self.assertIn('package eu.kanade.tachiyomi.extension.pt.', kt_a_text)
             self.assertIn('data-src', kt_a_text)
             self.assertIn('headersBuilder', kt_a_text)
             self.assertIn('parseChapterNumber', kt_a_text)
@@ -207,10 +225,14 @@ class FullAutomationEndToEndTests(unittest.TestCase):
                 allow_local_fixture=True,
                 output_dir=out_c,
             )
-            self.assertEqual(res_c['status'], 'PASS')
             self.assertEqual(res_c['ecosystem'], 'yuzono')
             self.assertTrue(res_c['code_implemented'])
             self.assertTrue(res_c['tests_verified'])
+            if _HAS_ANDROID_COMPILE_SANDBOX:
+                self.assertEqual(res_c['status'], 'PASS')
+                self.assertTrue(res_c['apk_ready'])
+            else:
+                self.assertEqual(res_c['status'], 'BLOCKED')
             kt_c = Path(res_c['persisted_files'][1])
             kt_c.write_text(
                 kt_c.read_text(encoding='utf-8')
@@ -275,11 +297,17 @@ class FullAutomationEndToEndTests(unittest.TestCase):
                     '--allow-local-fixture',
                     '--beginner',
                 ])
-            self.assertEqual(rc, 0)
+            self.assertIn(rc, {0} if _HAS_ANDROID_COMPILE_SANDBOX else {0, 2})
             spoken = buf_beg.getvalue()
             self.assertNotIn('{', spoken)
             self.assertNotIn('./gradlew', spoken)
+            self.assertNotIn('K2JVMCompiler', spoken)
             self.assertNotIn('Traceback', spoken)
+            if _HAS_ANDROID_COMPILE_SANDBOX:
+                self.assertIn('O que você deseja fazer?', spoken)
+                self.assertIn('1. Salvar em outra pasta.', spoken)
+                self.assertIn('2. Instalar e testar no celular.', spoken)
+                self.assertIn('3. Manter o APK onde está.', spoken)
 
     @unittest.skipUnless(nox_android.probe_bwrap_sandbox()['status'] == 'PASS', 'Bubblewrap sandbox unavailable on runner')
     def test_E_F_real_sandboxed_apk_build_and_post_build_delivery_choices(self):
@@ -346,6 +374,124 @@ class FullAutomationEndToEndTests(unittest.TestCase):
             self.assertEqual(res_fail['status'], 'FAIL')
             self.assertFalse(res_fail['apk_ready'])
             self.assertIsNone(res_fail['apk_options'])
+
+    def test_01_02_03_04_05_07_language_separation_real_execution_and_pass2_repair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tp = Path(tmp)
+
+            # Test 1: pt-BR metadata vs pt package/dir separation + sourceId continuity
+            norm_pt = nox_scaffold.normalize_ecosystem_language('keiyoushi', 'pt-BR')
+            self.assertEqual(norm_pt['metadata_lang'], 'pt-BR')
+            self.assertEqual(norm_pt['dir_lang'], 'pt')
+            self.assertEqual(norm_pt['package_lang'], 'pt')
+            sc_pt = nox_scaffold.scaffold_extension('keiyoushi', 'ScanBrasil', self.base_url, lang='pt-BR', output_dir=tp / 'pt_kei')
+            self.assertEqual(sc_pt['status'], 'PASS')
+            self.assertEqual(sc_pt['package_name'], 'eu.kanade.tachiyomi.extension.pt.scanbrasil')
+            self.assertEqual(sc_pt['source_id'], nox_env.compute_source_id('ScanBrasil', 'pt-BR', 1))
+            self.assertTrue(sc_pt['module_path'].endswith('/src/pt/scanbrasil'))
+            self.assertIn('lang = "pt-BR"', Path(sc_pt['created_files'][0]).read_text(encoding='utf-8'))
+
+            # Test 2: EN prompt auto-detects ui_lang='en' and compiles cleanly when toolchain present
+            out_en = tp / 'en_out'
+            res_en = nox_scaffold.auto_create_extension(
+                f'Create an extension for this manga site: {self.base_url}',
+                name='EnglishScan',
+                source_lang='en',
+                allow_local_fixture=True,
+                output_dir=out_en,
+            )
+            self.assertEqual(res_en['ui_lang'], 'en')
+            self.assertEqual(res_en['package_name'], 'eu.kanade.tachiyomi.extension.en.englishscan')
+            self.assertIn('/src/en/englishscan/', res_en['persisted_files'][1])
+            if _HAS_ANDROID_COMPILE_SANDBOX:
+                self.assertEqual(res_en['status'], 'PASS')
+                self.assertTrue(res_en['apk_ready'])
+                self.assertEqual(res_en['apk_options'][0]['label'], '1. Save to another folder.')
+
+            # Test 3: Yuzono pt-BR separation + sourceId
+            norm_yuz = nox_scaffold.normalize_ecosystem_language('yuzono', 'pt-BR')
+            self.assertEqual(norm_yuz['package_lang'], 'pt')
+            sc_yuz = nox_scaffold.scaffold_extension('yuzono', 'AnimeBR', self.base_url, lang='pt-BR', output_dir=tp / 'pt_yuz')
+            self.assertEqual(sc_yuz['package_name'], 'eu.kanade.tachiyomi.animeextension.pt.animebr')
+            self.assertEqual(sc_yuz['source_id'], nox_env.compute_source_id('AnimeBR', 'pt-BR', 1))
+
+            # Test 4: LNReader real Node.js execution fails cleanly on broken selector, passes when intact
+            lnr_dir = tp / 'pt_lnr'
+            sc_lnr = nox_scaffold.scaffold_extension(
+                'lnreader', 'NovelBrasil', self.base_url, lang='pt-BR', output_dir=lnr_dir,
+                catalog_path='/novels', catalog_selector='a.novel-card', chapter_selector='a.chapter', novel_content_selector='.chapter-content',
+            )
+            self.assertIn('/plugins/portuguese/', sc_lnr['module_path'])
+            ts_file = Path(sc_lnr['module_path'])
+            exec_ok = nox_scaffold.execute_extension_behavior('lnreader', [ts_file], self.base_url, allow_local_fixture=True)
+            self.assertEqual(exec_ok['status'], 'PASS')
+            self.assertEqual(exec_ok['engine'], 'node')
+            saved_ts = ts_file.read_text(encoding='utf-8')
+            ts_file.write_text(saved_ts.replace('.chapter-content', '.selector-inexistente'), encoding='utf-8')
+            exec_fail = nox_scaffold.execute_extension_behavior('lnreader', [ts_file], self.base_url, allow_local_fixture=True)
+            self.assertEqual(exec_fail['status'], 'FAIL')
+
+            # Test 5: Negative check — invalid Kotlin syntax or hyphenated pt-BR package MUST FAIL compilation & validation
+            bad_mod = tp / 'bad_kt'
+            bad_src = bad_mod / 'src/pt-BR/badext' / 'src/eu/kanade/tachiyomi/extension/pt-BR/badext'
+            bad_src.mkdir(parents=True)
+            bad_kt = bad_src / 'BadExt.kt'
+            bad_kt.write_text('package eu.kanade.tachiyomi.extension.pt-BR.badext\nclass BadExt { fun broken( {', encoding='utf-8')
+            bad_val = nox_scaffold.validate_generated_package_and_paths(
+                'keiyoushi', bad_mod / 'src/pt-BR/badext', [str(bad_kt)],
+                {'metadata_lang': 'pt-BR', 'dir_lang': 'pt', 'package_lang': 'pt'},
+            )
+            self.assertEqual(bad_val['status'], 'FAIL')
+            self.assertTrue(any('invalid_hyphen_in_kotlin_package' in i for i in bad_val['issues']))
+            if _HAS_ANDROID_COMPILE_SANDBOX:
+                comp_bad = nox_android.compile_kotlin_extension_to_debug_apk(
+                    bad_mod / 'src/pt-BR/badext',
+                    package_name='eu.kanade.tachiyomi.extension.pt.badext',
+                    class_name='BadExt',
+                )
+                self.assertEqual(comp_bad['status'], 'FAIL')
+                self.assertFalse(comp_bad['compiled'])
+
+            # Test 7a: Pass 2 non-regex repair fixes unexpected non-"broken" CSS selector, wrong endpoint path, & emptyList() body
+            unexp_dir = tp / 'unexpected_kei'
+            sc_unexp = nox_scaffold.scaffold_extension('keiyoushi', 'UnexpectedManga', self.base_url, lang='pt-BR', output_dir=unexp_dir)
+            uk_kt = Path(sc_unexp['created_files'][1])
+            orig_uk = uk_kt.read_text(encoding='utf-8')
+            mutated_uk = (
+                orig_uk
+                .replace('"$baseUrl/manga"', '"$baseUrl/wrong-catalog-endpoint"')
+                .replace('doc.select("a.manga-card[href]")', 'doc.select("section.weird-grid a.wrong-card")')
+                .replace(
+                    '    override suspend fun getPageList(chapter: SChapter): List<Page> {\n'
+                    '        val doc = client.get(getChapterUrl(chapter), Fetch.DOCUMENT).asJsoup()\n'
+                    '        return doc.select("img.page").mapIndexed { idx, img ->\n'
+                    '            val src = img.absUrl("data-src").ifBlank { img.absUrl("data-lazy-src") }.ifBlank { img.absUrl("src") }\n'
+                    '            Page(idx, imageUrl = src)\n'
+                    '        }\n'
+                    '    }',
+                    '    override suspend fun getPageList(chapter: SChapter): List<Page> = emptyList()',
+                )
+            )
+            uk_kt.write_text(mutated_uk, encoding='utf-8')
+            fix_unexp = nox_scaffold.auto_fix_extension(
+                unexp_dir, 'não carrega catálogo nem páginas', allow_local_fixture=True, technical=True,
+            )
+            self.assertEqual(fix_unexp['before_verification']['status'], 'FAIL')
+            self.assertEqual(fix_unexp['status'], 'PASS')
+            self.assertTrue(fix_unexp['code_modified'])
+            self.assertTrue(fix_unexp['tests_verified'])
+            repaired_uk = uk_kt.read_text(encoding='utf-8')
+            self.assertIn('"$baseUrl/manga"', repaired_uk)
+            self.assertIn('doc.select("a.manga-card[href]")', repaired_uk)
+            self.assertIn('doc.select("img.page")', repaired_uk)
+
+            # Test 7b: Unsolvable custom defect against unreachable/unknown bug never fakes PASS & exposes agent_solver
+            custom_dir = tp / 'unsolvable_custom'
+            sc_cust = nox_scaffold.scaffold_extension('keiyoushi', 'CustomCrypt', 'https://unknown.example', lang='en', output_dir=custom_dir)
+            fix_cust = nox_scaffold.auto_fix_extension(custom_dir, 'custom AES decryption fails', technical=True)
+            self.assertEqual(fix_cust['status'], 'INCONCLUSIVE')
+            self.assertIsNotNone(fix_cust.get('agent_solver'))
+            self.assertTrue(fix_cust['agent_continuation']['must_continue_automatically'])
 
 
 if __name__ == '__main__':

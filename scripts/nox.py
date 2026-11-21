@@ -41,14 +41,18 @@ def _emit(payload: dict[str, Any], *, as_json: bool = True, beginner: bool = Fal
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return
     status = payload.get('status') or payload.get('overall_status') or 'UNKNOWN'
-    is_en = lang == 'en'
+    eff_lang = payload.get('ui_lang') or lang or 'pt-BR'
+    is_en = eff_lang == 'en'
     if payload.get('user_message'):
         print(payload['user_message'])
-        if payload.get('limitations'):
+        if payload.get('limitations') and not payload.get('apk_ready'):
             for lim in payload['limitations']:
-                print(f'- {lim}')
+                if not any(tok in str(lim) for tok in ('{', 'Traceback', './gradlew', 'K2JVMCompiler', 'bwrap')):
+                    print(f'- {lim}')
         if payload.get('apk_ready') and payload.get('apk_options'):
             print()
+            if payload.get('next_step'):
+                print(payload['next_step'])
             for opt in payload['apk_options']:
                 print(opt['label'])
         elif payload.get('next_step'):
@@ -161,7 +165,7 @@ def _build_raw_parser() -> argparse.ArgumentParser:
     p.add_argument('--json', action='store_true', default=True, help='emit machine-readable JSON (default)')
     p.add_argument('--beginner', action='store_true', help='emit short beginner-friendly summary')
     p.add_argument('--technical', nargs=0, action=_TechnicalModeAction, default=False, help='emit full technical JSON details')
-    p.add_argument('--lang', choices=['pt-BR', 'en'], default='pt-BR', help='output language for summaries')
+    p.add_argument('--lang', choices=['pt-BR', 'en'], default=None, help='output language for summaries (auto-detected when omitted)')
     p.add_argument('--dry-run', action='store_true', help='inspect without modifying persistent files')
 
     sub = p.add_subparsers(dest='command', required=True)
@@ -576,7 +580,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if cmd == 'auto':
         prompt_str = ' '.join(args.prompt).strip()
-        lang = getattr(args, 'lang', 'pt-BR')
+        explicit_lang = getattr(args, 'lang', None)
+        lang = explicit_lang or nox_scaffold.detect_user_ui_language(args.symptom if args.target is not None else prompt_str, default='pt-BR')
         technical = bool(getattr(args, 'technical', False))
         parsed = nox_issues.parse_natural_language_request(prompt_str) if prompt_str else {'intent': 'create'}
         if args.target is not None:
@@ -584,7 +589,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.target,
                 args.symptom,
                 ecosystem=args.ecosystem,
-                ui_lang=lang,
+                ui_lang=explicit_lang,
                 build_task=args.build_task,
                 technical=technical,
                 site_url=args.site_url,
@@ -596,16 +601,17 @@ def main(argv: list[str] | None = None) -> int:
                     {
                         'status': 'INCONCLUSIVE',
                         'action': 'auto',
+                        'ui_lang': lang,
                         'ecosystem': args.ecosystem or parsed.get('inferred_ecosystem'),
                         'user_message': (
                             'To automatically diagnose and fix a broken extension, tell me its folder or file (--target).'
                             if lang == 'en'
-                            else 'Para diagnosticar e corrigir uma extensao quebrada automaticamente, informe a pasta ou arquivo dela (--target).'
+                            else 'Para diagnosticar e corrigir uma extensão quebrada automaticamente, informe a pasta ou arquivo dela (--target).'
                         ),
                         'next_step': (
                             'Send the extension name/folder or describe what stops working (search, chapters, or images).'
                             if lang == 'en'
-                            else 'Envie a pasta/arquivo da extensao ou descreva o problema (busca, capitulos ou imagens).'
+                            else 'Envie a pasta/arquivo da extensão ou descreva o problema (busca, capítulos ou imagens).'
                         ),
                         'parsed_request': parsed,
                     },
@@ -618,7 +624,7 @@ def main(argv: list[str] | None = None) -> int:
                 prompt_str or 'Create extension',
                 name=args.name,
                 ecosystem=args.ecosystem,
-                ui_lang=lang,
+                ui_lang=explicit_lang,
                 output_dir=args.output,
                 repo_root=args.repo,
                 build_task=args.build_task,
@@ -627,18 +633,18 @@ def main(argv: list[str] | None = None) -> int:
                 site_url=args.site_url,
                 allow_local_fixture=bool(args.allow_local_fixture),
             )
-        _emit(res, as_json=args.json, beginner=args.beginner, lang=lang)
+        _emit(res, as_json=args.json, beginner=args.beginner, lang=res.get('ui_lang', lang))
         return _exit_code_for_status(res['status'])
 
     if cmd == 'auto-create':
-        lang = getattr(args, 'lang', 'pt-BR')
+        explicit_lang = getattr(args, 'lang', None)
         technical = bool(getattr(args, 'technical', False))
         res = nox_scaffold.auto_create_extension(
             ' '.join(args.prompt),
             name=args.name,
             ecosystem=args.ecosystem,
             source_lang=args.source_lang,
-            ui_lang=lang,
+            ui_lang=explicit_lang,
             output_dir=args.output,
             repo_root=args.repo,
             build_task=args.build_task,
@@ -647,11 +653,11 @@ def main(argv: list[str] | None = None) -> int:
             site_url=args.site_url,
             allow_local_fixture=bool(args.allow_local_fixture),
         )
-        _emit(res, as_json=args.json, beginner=args.beginner, lang=lang)
+        _emit(res, as_json=args.json, beginner=args.beginner, lang=res.get('ui_lang', 'pt-BR'))
         return _exit_code_for_status(res['status'])
 
     if cmd == 'auto-fix':
-        lang = getattr(args, 'lang', 'pt-BR')
+        explicit_lang = getattr(args, 'lang', None)
         technical = bool(getattr(args, 'technical', False))
         attempts: list[dict[str, Any]] = []
         if args.attempts_json and args.attempts_json.is_file():
@@ -662,14 +668,14 @@ def main(argv: list[str] | None = None) -> int:
             args.target,
             args.symptom,
             ecosystem=args.ecosystem,
-            ui_lang=lang,
+            ui_lang=explicit_lang,
             attempts=attempts,
             build_task=args.build_task,
             technical=technical,
             site_url=args.site_url,
             allow_local_fixture=bool(args.allow_local_fixture),
         )
-        _emit(res, as_json=args.json, beginner=args.beginner, lang=lang)
+        _emit(res, as_json=args.json, beginner=args.beginner, lang=res.get('ui_lang', 'pt-BR'))
         return _exit_code_for_status(res['status'])
 
     if cmd == 'apk-deliver':
